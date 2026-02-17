@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Link } from "react-router-dom";
-import CarTollGate from "../components/CarTollgate";
+import CarTollGate from "../components/Cartollgate";
 import TicketQueue from "../components/Ticketqueue";
 
 const scenarios = [
