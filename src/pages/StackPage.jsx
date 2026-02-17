@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Link } from "react-router-dom";
-import BookStack from "../components/BookStack";
+import BookStack from "../components/Bookstack";
 import StorageBoxes from "../components/Storageboxes";
 
 const scenarios = [
