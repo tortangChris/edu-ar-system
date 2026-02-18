@@ -43,59 +43,68 @@ const INITIAL_ITEMS = [
 ];
 
 // ─── Raw WebXR Session Manager ────────────────────────────────────────────────
-// Mirrors the Immersive Web hit-test sample exactly.
-// No @react-three/xr — direct navigator.xr API calls.
 class XRSessionManager {
   constructor() {
     this.session = null;
-    this.refSpace = null; // 'local'
-    this.viewerSpace = null; // 'viewer' — for hit-test ray origin
+    this.refSpace = null;
+    this.viewerSpace = null;
     this.hitTestSource = null;
-    this.hitMatrix = null; // latest THREE.Matrix4 from hit-test
+    this.hitMatrix = null;
     this.isActive = false;
-    this.onHit = null; // (matrix: THREE.Matrix4 | null) => void
-    this.onEnd = null; // () => void
-    this.onSelect = null; // (matrix: THREE.Matrix4) => void — tap to place
+    this.onHit = null;
+    this.onEnd = null;
+    this.onSelect = null;
   }
 
   async start(gl) {
-    // 1. Check API availability
     if (!navigator.xr) throw new Error("WebXR not available on this browser.");
 
     const supported = await navigator.xr.isSessionSupported("immersive-ar");
     if (!supported)
       throw new Error("immersive-ar not supported on this device.");
 
-    // 2. Camera permission — explicit request before session (avoids silent denial)
+    // Camera permission first — clear error message if denied
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment" },
       });
-      stream.getTracks().forEach((t) => t.stop()); // release — WebXR takes over camera
+      stream.getTracks().forEach((t) => t.stop());
     } catch (err) {
       if (err.name === "NotAllowedError") {
         throw new Error(
-          "Camera access was denied. Please tap 'Allow' when prompted and try again.",
+          "Camera access denied. Please tap 'Allow' when prompted, then try again.",
         );
       }
-      throw new Error("Could not access camera: " + err.message);
+      throw new Error("Camera error: " + err.message);
     }
 
-    // 3. Make the existing WebGL context XR-compatible
+    // Make existing canvas GL context XR-compatible
     await gl.getContext().makeXRCompatible?.();
 
-    // 4. Request AR session — same flags as the working Immersive Web sample
-    this.session = await navigator.xr.requestSession("immersive-ar", {
-      requiredFeatures: ["local", "hit-test"],
-      optionalFeatures: ["dom-overlay"],
-      domOverlay: { root: document.getElementById("ar-overlay") },
-    });
+    // ── CRITICAL FIX ──
+    // The overlay element MUST exist in DOM before requestSession is called.
+    // We always render <div id="ar-overlay"> in the JSX (never conditionally),
+    // so it is guaranteed to be present here.
+    const overlayRoot = document.getElementById("ar-overlay");
 
-    // 5. Bind session to the existing R3F canvas gl context
+    const sessionInit = {
+      requiredFeatures: ["local", "hit-test"],
+    };
+
+    // Only add domOverlay if the element actually exists (safety check)
+    if (overlayRoot) {
+      sessionInit.optionalFeatures = ["dom-overlay"];
+      sessionInit.domOverlay = { root: overlayRoot };
+    }
+
+    this.session = await navigator.xr.requestSession(
+      "immersive-ar",
+      sessionInit,
+    );
+
     const baseLayer = new XRWebGLLayer(this.session, gl.getContext());
     this.session.updateRenderState({ baseLayer });
 
-    // 6. Session lifecycle
     this.session.addEventListener("end", () => {
       this.hitTestSource = null;
       this.session = null;
@@ -106,14 +115,12 @@ class XRSessionManager {
       this.onEnd?.();
     });
 
-    // 7. Tap → place (one-time, matches sample's onSelect)
     this.session.addEventListener("select", () => {
       if (this.hitMatrix && this.onSelect) {
         this.onSelect(this.hitMatrix.clone());
       }
     });
 
-    // 8. Setup reference spaces — same as sample
     this.viewerSpace = await this.session.requestReferenceSpace("viewer");
     this.hitTestSource = await this.session.requestHitTestSource({
       space: this.viewerSpace,
@@ -124,10 +131,8 @@ class XRSessionManager {
     return this.session;
   }
 
-  // Called every frame from R3F's useFrame loop
   processFrame(frame) {
     if (!this.hitTestSource || !this.refSpace || !frame) return;
-
     const results = frame.getHitTestResults(this.hitTestSource);
     if (results.length > 0) {
       const pose = results[0].getPose(this.refSpace);
@@ -137,7 +142,6 @@ class XRSessionManager {
         return;
       }
     }
-    // No surface detected
     this.hitMatrix = null;
     this.onHit?.(null);
   }
@@ -149,11 +153,9 @@ class XRSessionManager {
   }
 }
 
-// Singleton — survives re-renders
 const xrManager = new XRSessionManager();
 
-// ─── Reticle (ring on detected surface) ──────────────────────────────────────
-// Positioned via raw hit-test matrix — same approach as the sample's reticle.gltf
+// ─── Reticle ──────────────────────────────────────────────────────────────────
 function Reticle({ hitMatrix }) {
   const ref = useRef();
 
@@ -174,7 +176,6 @@ function Reticle({ hitMatrix }) {
 
   return (
     <group ref={ref} visible={false} matrixAutoUpdate={false}>
-      {/* Outer ring */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[0.09, 0.13, 32]} />
         <meshBasicMaterial
@@ -184,7 +185,6 @@ function Reticle({ hitMatrix }) {
           side={THREE.DoubleSide}
         />
       </mesh>
-      {/* Pulse ring */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
         <ringGeometry args={[0.16, 0.175, 32]} />
         <meshBasicMaterial
@@ -194,7 +194,6 @@ function Reticle({ hitMatrix }) {
           side={THREE.DoubleSide}
         />
       </mesh>
-      {/* Center dot */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
         <circleGeometry args={[0.025, 16]} />
         <meshBasicMaterial
@@ -208,8 +207,8 @@ function Reticle({ hitMatrix }) {
   );
 }
 
-// ─── XR Frame Bridge — feeds raw WebXR frames into R3F loop ──────────────────
-function XRFrameBridge({ isAR, onHitMatrix }) {
+// ─── XR Frame Bridge ──────────────────────────────────────────────────────────
+function XRFrameBridge({ isAR }) {
   const { gl } = useThree();
 
   useEffect(() => {
@@ -222,15 +221,13 @@ function XRFrameBridge({ isAR, onHitMatrix }) {
   useFrame((state) => {
     if (!isAR || !xrManager.isActive) return;
     const frame = state.gl.xr.getFrame?.();
-    if (frame) {
-      xrManager.processFrame(frame);
-    }
+    if (frame) xrManager.processFrame(frame);
   });
 
   return null;
 }
 
-// ─── Single Grocery Box ───────────────────────────────────────────────────────
+// ─── Grocery Box ──────────────────────────────────────────────────────────────
 function GroceryBox({ position, index, product, isSelected, onClick }) {
   const groupRef = useRef();
   const boxRef = useRef();
@@ -382,14 +379,10 @@ function ShelfFrame({ height, width }) {
   );
 }
 
-// ─── Shelf Group — handles both normal and AR positioning ────────────────────
 function ShelfContents({ items, selectedIndex, onSelect }) {
   const ITEM_W = 0.95;
   const ROW = Math.ceil(items.length / 2);
   const SHELF_Y = [-0.3, 1.15];
-  const row0 = items.slice(0, ROW);
-  const row1 = items.slice(ROW);
-
   const renderRow = (row, startIdx, shelfY) =>
     row.map((product, i) => (
       <GroceryBox
@@ -401,14 +394,13 @@ function ShelfContents({ items, selectedIndex, onSelect }) {
         onClick={onSelect}
       />
     ));
-
   return (
     <>
       <ShelfFrame height={2.4} width={ROW * ITEM_W} />
       <ShelfBoard y={SHELF_Y[0]} width={ROW * ITEM_W} />
       <ShelfBoard y={SHELF_Y[1]} width={ROW * ITEM_W} />
-      {renderRow(row0, 0, SHELF_Y[0])}
-      {renderRow(row1, ROW, SHELF_Y[1])}
+      {renderRow(items.slice(0, ROW), 0, SHELF_Y[0])}
+      {renderRow(items.slice(ROW), ROW, SHELF_Y[1])}
     </>
   );
 }
@@ -421,11 +413,7 @@ function ShelfScene({
   placedMatrix,
   hitMatrix,
 }) {
-  const ITEM_W = 0.95;
-  const ROW = Math.ceil(items.length / 2);
   const AR_SCALE = 0.28;
-
-  // AR anchor group — positioned once when user taps
   const anchorRef = useRef();
 
   useEffect(() => {
@@ -453,13 +441,10 @@ function ShelfScene({
       />
       <pointLight position={[0, 3, 2]} intensity={0.5} color="#fff5e0" />
 
-      {/* Hooks raw WebXR frame into R3F loop */}
       <XRFrameBridge isAR={isAR} />
 
-      {/* Reticle — visible before placement */}
       {isAR && !placedMatrix && <Reticle hitMatrix={hitMatrix} />}
 
-      {/* Normal 3D mode shelf */}
       {!isAR && (
         <group position={[0, -0.6, 0]}>
           <ShelfContents
@@ -470,7 +455,6 @@ function ShelfScene({
         </group>
       )}
 
-      {/* AR mode shelf — placed at tapped anchor */}
       {isAR && placedMatrix && (
         <group ref={anchorRef}>
           <ShelfContents
@@ -498,8 +482,12 @@ function ShelfScene({
   );
 }
 
-// ─── AR Overlay HUD (dom-overlay so it shows over camera feed) ───────────────
+// ─── AR Overlay ───────────────────────────────────────────────────────────────
+// ALWAYS rendered in DOM — never conditionally mounted.
+// Visibility is controlled via CSS display/opacity, not React conditional rendering.
+// This guarantees document.getElementById("ar-overlay") never returns null.
 function AROverlay({
+  isAR,
   placedMatrix,
   hasHit,
   items,
@@ -517,7 +505,6 @@ function AROverlay({
   onExit,
 }) {
   return (
-    // id="ar-overlay" is passed as domOverlay root to the XR session
     <div
       id="ar-overlay"
       style={{
@@ -526,10 +513,12 @@ function AROverlay({
         zIndex: 9999,
         pointerEvents: "none",
         fontFamily: "'Courier New', monospace",
+        // Hidden when not in AR — but element always exists in DOM
+        display: isAR ? "block" : "none",
       }}
     >
-      {/* ── Scanning / pre-placement state ── */}
-      {!placedMatrix && (
+      {/* Scanning state */}
+      {isAR && !placedMatrix && (
         <div
           style={{
             position: "absolute",
@@ -586,10 +575,10 @@ function AROverlay({
         </div>
       )}
 
-      {/* ── After placement: full operation HUD ── */}
-      {placedMatrix && (
+      {/* Placed state — full HUD */}
+      {isAR && placedMatrix && (
         <>
-          {/* Top info bar */}
+          {/* Top bar */}
           <div
             style={{
               position: "absolute",
@@ -617,7 +606,7 @@ function AROverlay({
             </span>
           </div>
 
-          {/* Tabs */}
+          {/* Tab buttons */}
           <div
             style={{
               position: "absolute",
@@ -882,21 +871,18 @@ export default function GroceryShelf() {
     updateProduct: "juice",
   });
 
-  // AR state
   const [isAR, setIsAR] = useState(false);
-  const [placedMatrix, setPlacedMatrix] = useState(null); // THREE.Matrix4
-  const [hitMatrix, setHitMatrix] = useState(null); // live reticle matrix
+  const [placedMatrix, setPlacedMatrix] = useState(null);
+  const [hitMatrix, setHitMatrix] = useState(null);
   const [arError, setArError] = useState(null);
   const [arStarting, setArStarting] = useState(false);
 
-  // Keep a ref to the R3F gl object so XRSessionManager can use it
   const glRef = useRef(null);
 
   const addLog = (msg, type = "info") =>
     setLog((prev) => [{ msg, type, id: Date.now() }, ...prev].slice(0, 8));
   const setInput = (key, val) => setInputs((prev) => ({ ...prev, [key]: val }));
 
-  // DS operations — untouched
   const handleSelect = (idx) => {
     setSelectedIndex((prev) => (prev === idx ? null : idx));
     addLog(`Selected [${idx}] → "${items[idx]}"`, "select");
@@ -954,23 +940,17 @@ export default function GroceryShelf() {
     setLog([]);
   };
 
-  // ── Enter AR ──
-  // Mirrors the Immersive Web sample's onRequestSession + onSessionStarted
   const handleEnterAR = async () => {
     setArError(null);
     setArStarting(true);
     setPlacedMatrix(null);
     setHitMatrix(null);
 
-    // Wire callbacks
     xrManager.onHit = (matrix) => setHitMatrix(matrix ? matrix.clone() : null);
-
-    // One-time placement — same as sample's addARObjectAt called from onSelect
     xrManager.onSelect = (matrix) => {
       setPlacedMatrix(matrix.clone());
-      xrManager.onSelect = null; // only place once
+      xrManager.onSelect = null; // one-time placement
     };
-
     xrManager.onEnd = () => {
       setIsAR(false);
       setPlacedMatrix(null);
@@ -988,7 +968,7 @@ export default function GroceryShelf() {
     }
   };
 
-  const handleExitAR = () => xrManager.end(); // onEnd handles state reset
+  const handleExitAR = () => xrManager.end();
 
   const tabBtn = (tab, emoji, label) => (
     <button
@@ -1009,26 +989,30 @@ export default function GroceryShelf() {
       className="flex flex-col gap-4 w-full"
       style={{ fontFamily: "'Courier New', monospace" }}
     >
-      {/* AR overlay — mounted always so dom-overlay ref exists when session starts */}
-      {isAR && (
-        <AROverlay
-          placedMatrix={placedMatrix}
-          hasHit={!!hitMatrix}
-          items={items}
-          selectedIndex={selectedIndex}
-          activeTab={activeTab}
-          inputs={inputs}
-          log={log}
-          onAccess={handleAccess}
-          onInsert={handleInsert}
-          onDelete={handleDelete}
-          onUpdate={handleUpdate}
-          onReset={handleReset}
-          setInput={setInput}
-          setActiveTab={setActiveTab}
-          onExit={handleExitAR}
-        />
-      )}
+      {/*
+        ── CRITICAL: AROverlay is ALWAYS rendered, never conditionally mounted ──
+        The div#ar-overlay must exist in the DOM before requestSession() is called.
+        We control visibility via the `display: isAR ? "block" : "none"` CSS inside
+        AROverlay, NOT by mounting/unmounting the component.
+      */}
+      <AROverlay
+        isAR={isAR}
+        placedMatrix={placedMatrix}
+        hasHit={!!hitMatrix}
+        items={items}
+        selectedIndex={selectedIndex}
+        activeTab={activeTab}
+        inputs={inputs}
+        log={log}
+        onAccess={handleAccess}
+        onInsert={handleInsert}
+        onDelete={handleDelete}
+        onUpdate={handleUpdate}
+        onReset={handleReset}
+        setInput={setInput}
+        setActiveTab={setActiveTab}
+        onExit={handleExitAR}
+      />
 
       {/* Header */}
       <div className="text-center">
@@ -1077,16 +1061,6 @@ export default function GroceryShelf() {
             <div style={{ color: "rgba(255,255,255,0.65)", fontSize: 12 }}>
               {arError}
             </div>
-            <div
-              style={{
-                color: "rgba(255,255,255,0.35)",
-                fontSize: 11,
-                marginTop: 6,
-              }}
-            >
-              Requires Android Chrome 81+ over HTTPS · iOS Safari not yet
-              supported by WebXR
-            </div>
           </div>
         </div>
       )}
@@ -1117,7 +1091,7 @@ export default function GroceryShelf() {
         </div>
       )}
 
-      {/* 3D Canvas — stays mounted always; WebXR reuses its gl context */}
+      {/* 3D Canvas — always mounted, WebXR reuses its gl context */}
       <div
         className="w-full rounded-2xl overflow-hidden border-2 border-amber-400/30 shadow-[0_0_40px_rgba(251,191,36,0.12)]"
         style={{
@@ -1132,7 +1106,6 @@ export default function GroceryShelf() {
           shadows
           gl={{ alpha: true, antialias: true, xrCompatible: true }}
           onCreated={({ gl }) => {
-            // Save gl reference so AR session can call makeXRCompatible on it
             glRef.current = gl;
           }}
         >
@@ -1150,7 +1123,6 @@ export default function GroceryShelf() {
       {/* Normal 3D mode UI */}
       {!isAR && (
         <>
-          {/* Index row */}
           <div className="flex gap-1 flex-wrap justify-center">
             {items.map((item, i) => (
               <button
@@ -1172,7 +1144,6 @@ export default function GroceryShelf() {
             ))}
           </div>
 
-          {/* Bottom panels */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
               <div className="flex gap-2 mb-4 flex-wrap">
