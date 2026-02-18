@@ -13,14 +13,14 @@ import * as THREE from "three";
 // ─── XR Store ─────────────────────────────────────────────────────────────────
 const xrStore = createXRStore();
 
-// ─── Placement state machine ──────────────────────────────────────────────────
+// ─── Placement states ─────────────────────────────────────────────────────────
 const PS = {
   SCANNING: "scanning",
   PREVIEWING: "previewing",
   CONFIRMED: "confirmed",
 };
 
-// ─── Colors / data ────────────────────────────────────────────────────────────
+// ─── Product data ─────────────────────────────────────────────────────────────
 const PRODUCT_COLORS = {
   apple: { box: "#e74c3c", label: "#c0392b", text: "#fff" },
   milk: { box: "#ecf0f1", label: "#bdc3c7", text: "#2c3e50" },
@@ -53,39 +53,54 @@ const INITIAL_ITEMS = [
   "bread",
 ];
 
-// ─── Raw WebXR Hit-Test (mirrors the Immersive Web reference exactly) ─────────
-//
-//  1. requestReferenceSpace('viewer')  → ray from camera center
-//  2. requestHitTestSource({ space: viewerSpace })
-//  3. every frame: frame.getHitTestResults(source)[0].getPose(localRefSpace)
-//
-function useRawHitTest({ enabled, onHitPose, onNoHit }) {
-  const { gl } = useThree();
-  const hitTestSourceRef = useRef(null);
-  const localRefSpaceRef = useRef(null);
-  const mountedRef = useRef(true);
-
+// ─── useARSupport ─────────────────────────────────────────────────────────────
+function useARSupport() {
+  const [supported, setSupported] = useState(null);
   useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
+    if (!navigator.xr) {
+      setSupported(false);
+      return;
+    }
+    navigator.xr
+      .isSessionSupported("immersive-ar")
+      .then(setSupported)
+      .catch(() => setSupported(false));
   }, []);
+  return supported;
+}
 
+// ─── AR Core: hit-test + select listener ─────────────────────────────────────
+// Lives inside <XR> so gl.xr is available.
+// Key fix: hitPosRef is a ref (not state), so the `select` handler always
+// reads the LATEST hit position without any stale closure problem.
+function ARCore({
+  active,
+  hitPosRef,
+  onHitPos,
+  onNoHit,
+  onTap,
+  setPlaceState,
+  setAnchorPos,
+}) {
+  const { gl } = useThree();
+
+  const hitTestSourceRef = useRef(null);
+  const localSpaceRef = useRef(null);
+
+  // Set up hit-test source once when active
   useEffect(() => {
-    if (!enabled) return;
+    if (!active) return;
 
     const session = gl.xr?.getSession?.();
     if (!session) return;
 
     let cancelled = false;
 
-    // Step 1 + 2 from reference
     session
       .requestReferenceSpace("local")
       .then((localSpace) => {
         if (cancelled) return;
-        localRefSpaceRef.current = localSpace;
+        localSpaceRef.current = localSpace;
 
         session
           .requestReferenceSpace("viewer")
@@ -96,7 +111,9 @@ function useRawHitTest({ enabled, onHitPose, onNoHit }) {
               .requestHitTestSource({ space: viewerSpace })
               .then((source) => {
                 if (cancelled) {
-                  source.cancel();
+                  try {
+                    source.cancel();
+                  } catch (_) {}
                   return;
                 }
                 hitTestSourceRef.current = source;
@@ -107,70 +124,81 @@ function useRawHitTest({ enabled, onHitPose, onNoHit }) {
       })
       .catch(console.warn);
 
+    // select = screen tap (or controller trigger)
+    // Reading hitPosRef.current here is ALWAYS fresh — no stale closure
+    const handleSelect = () => {
+      const pos = hitPosRef.current;
+      if (!pos) return;
+      setAnchorPos(pos.clone());
+      setPlaceState(PS.PREVIEWING);
+    };
+
+    session.addEventListener("select", handleSelect);
+
     return () => {
       cancelled = true;
+      session.removeEventListener("select", handleSelect);
       if (hitTestSourceRef.current) {
         try {
           hitTestSourceRef.current.cancel();
         } catch (_) {}
         hitTestSourceRef.current = null;
       }
-      localRefSpaceRef.current = null;
+      localSpaceRef.current = null;
     };
-  }, [enabled, gl]);
+  }, [active, gl]); // stable refs — no re-render deps needed
 
-  // Step 3 from reference — runs every XR frame
+  // Every frame: poll hit-test results and update the ref + visual
   useFrame((_, __, frame) => {
-    if (!enabled || !frame) return;
+    if (!active || !frame) return;
     const source = hitTestSourceRef.current;
-    const refSpace = localRefSpaceRef.current;
+    const refSpace = localSpaceRef.current;
     if (!source || !refSpace) return;
 
     const results = frame.getHitTestResults(source);
     if (results.length > 0) {
       const pose = results[0].getPose(refSpace);
       if (pose) {
-        onHitPose(pose.transform.matrix);
+        onHitPos(pose.transform.matrix); // pass raw matrix to reticle
         return;
       }
     }
     onNoHit();
   });
+
+  return null;
 }
 
-// ─── AR Reticle ───────────────────────────────────────────────────────────────
-function ARReticle({ onHitPos, onNoHit }) {
+// ─── AR Reticle (pure visual, receives matrix from ARCore) ────────────────────
+function ARReticle({ matrixRef }) {
   const reticleRef = useRef();
   const pulseRef = useRef();
   const mat4 = useRef(new THREE.Matrix4());
 
-  useRawHitTest({
-    enabled: true,
-    onHitPose: (matrix) => {
-      if (!reticleRef.current) return;
-      reticleRef.current.visible = true;
-      mat4.current.fromArray(matrix);
-      // decompose so position/quaternion/scale are set from the hit matrix
-      mat4.current.decompose(
-        reticleRef.current.position,
-        reticleRef.current.quaternion,
-        reticleRef.current.scale,
-      );
-      onHitPos(reticleRef.current.position.clone());
-    },
-    onNoHit: () => {
-      if (reticleRef.current) reticleRef.current.visible = false;
-      onNoHit();
-    },
-  });
-
-  // Pulse animation
+  // Apply the latest hit matrix every frame
   useFrame(({ clock }) => {
-    if (!pulseRef.current) return;
-    const t = clock.elapsedTime;
-    const s = 1 + 0.18 * Math.sin(t * 3.5);
-    pulseRef.current.scale.set(s, s, 1);
-    pulseRef.current.material.opacity = 0.2 + 0.12 * Math.sin(t * 3.5);
+    const m = matrixRef.current;
+    if (reticleRef.current) {
+      if (m) {
+        reticleRef.current.visible = true;
+        mat4.current.fromArray(m);
+        mat4.current.decompose(
+          reticleRef.current.position,
+          reticleRef.current.quaternion,
+          reticleRef.current.scale,
+        );
+      } else {
+        reticleRef.current.visible = false;
+      }
+    }
+
+    // Pulse animation
+    if (pulseRef.current) {
+      const t = clock.elapsedTime;
+      const s = 1 + 0.18 * Math.sin(t * 3.5);
+      pulseRef.current.scale.set(s, s, 1);
+      pulseRef.current.material.opacity = 0.2 + 0.12 * Math.sin(t * 3.5);
+    }
   });
 
   return (
@@ -210,35 +238,6 @@ function ARReticle({ onHitPos, onNoHit }) {
       </mesh>
     </group>
   );
-}
-
-// ─── `select` tap listener (screen tap in AR = XRInputSource select event) ────
-function ARTapListener({ active, onTap }) {
-  const { gl } = useThree();
-  useEffect(() => {
-    if (!active) return;
-    const session = gl.xr?.getSession?.();
-    if (!session) return;
-    session.addEventListener("select", onTap);
-    return () => session.removeEventListener("select", onTap);
-  }, [active, gl, onTap]);
-  return null;
-}
-
-// ─── useARSupport ─────────────────────────────────────────────────────────────
-function useARSupport() {
-  const [supported, setSupported] = useState(null);
-  useEffect(() => {
-    if (!navigator.xr) {
-      setSupported(false);
-      return;
-    }
-    navigator.xr
-      .isSessionSupported("immersive-ar")
-      .then(setSupported)
-      .catch(() => setSupported(false));
-  }, []);
-  return supported;
 }
 
 // ─── GroceryBox ───────────────────────────────────────────────────────────────
@@ -395,15 +394,14 @@ function ShelfScene({
   isAR,
   placeState,
   anchorPos,
-  onHitPos,
-  onNoHit,
-  onTap,
+  hitPosRef,
+  hitMatrixRef,
+  setPlaceState,
+  setAnchorPos,
 }) {
   const ITEM_W = 0.95;
   const ROW = Math.ceil(items.length / 2);
   const SHELF_Y = [-0.3, 1.15];
-  const row0 = items.slice(0, ROW);
-  const row1 = items.slice(ROW);
   const AR_SCALE = 0.28;
 
   const shelfProps =
@@ -429,6 +427,21 @@ function ShelfScene({
       />
     ));
 
+  // Update hitPosRef from the raw matrix so select handler can always read it
+  const handleHitPos = useCallback((matrix) => {
+    hitMatrixRef.current = matrix;
+    // Decode position from matrix for the ref
+    const m = new THREE.Matrix4().fromArray(matrix);
+    const pos = new THREE.Vector3();
+    m.decompose(pos, new THREE.Quaternion(), new THREE.Vector3());
+    hitPosRef.current = pos;
+  }, []);
+
+  const handleNoHit = useCallback(() => {
+    hitMatrixRef.current = null;
+    hitPosRef.current = null;
+  }, []);
+
   return (
     <>
       <ambientLight intensity={isAR ? 1.0 : 0.6} />
@@ -444,14 +457,21 @@ function ShelfScene({
       />
       <pointLight position={[0, 3, 2]} intensity={0.5} color="#fff5e0" />
 
-      {/* Reticle — only while scanning */}
-      {isAR && placeState === PS.SCANNING && (
-        <ARReticle onHitPos={onHitPos} onNoHit={onNoHit} />
+      {/* AR Core: hit-test setup + select listener, only while scanning */}
+      {isAR && (
+        <ARCore
+          active={placeState === PS.SCANNING}
+          hitPosRef={hitPosRef}
+          onHitPos={handleHitPos}
+          onNoHit={handleNoHit}
+          setPlaceState={setPlaceState}
+          setAnchorPos={setAnchorPos}
+        />
       )}
 
-      {/* Tap listener — active only while scanning */}
-      {isAR && (
-        <ARTapListener active={placeState === PS.SCANNING} onTap={onTap} />
+      {/* Reticle reads from hitMatrixRef — only while scanning */}
+      {isAR && placeState === PS.SCANNING && (
+        <ARReticle matrixRef={hitMatrixRef} />
       )}
 
       {/* Shelf */}
@@ -460,8 +480,8 @@ function ShelfScene({
           <ShelfFrame height={2.4} width={ROW * ITEM_W} />
           <ShelfBoard y={SHELF_Y[0]} width={ROW * ITEM_W} />
           <ShelfBoard y={SHELF_Y[1]} width={ROW * ITEM_W} />
-          {renderRow(row0, 0, SHELF_Y[0])}
-          {renderRow(row1, ROW, SHELF_Y[1])}
+          {renderRow(items.slice(0, ROW), 0, SHELF_Y[0])}
+          {renderRow(items.slice(ROW), ROW, SHELF_Y[1])}
         </group>
       )}
 
@@ -526,7 +546,6 @@ function ARHud({
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            gap: 12,
             pointerEvents: "none",
           }}
         >
@@ -927,8 +946,7 @@ function ARUnsupportedBanner() {
           AR Not Supported
         </div>
         <div style={{ color: "rgba(255,255,255,0.5)", fontSize: 11 }}>
-          Use Android Chrome 81+ or a WebXR-compatible browser. iOS Safari not
-          supported.
+          Use Android Chrome 81+. iOS Safari not supported.
         </div>
       </div>
     </div>
@@ -951,13 +969,20 @@ export default function GroceryShelf() {
 
   const [isAR, setIsAR] = useState(false);
   const [placeState, setPlaceState] = useState(PS.SCANNING);
-  const [anchorPos, setAnchorPos] = useState(null); // THREE.Vector3, locked
-  const [hitPos, setHitPos] = useState(null); // THREE.Vector3, live reticle
+  const [anchorPos, setAnchorPos] = useState(null); // locked THREE.Vector3
+
+  // ─── THE KEY FIX: store live hit data in REFS, not state ──────────────────
+  // Refs are always fresh inside event handlers — no stale closure ever.
+  const hitPosRef = useRef(null); // THREE.Vector3, latest reticle world pos
+  const hitMatrixRef = useRef(null); // Float32Array 4x4, for reticle rendering
+
+  // hasHit drives the HUD label only — OK to be a state derived from renders
+  const [hasHit, setHasHit] = useState(false);
+
   const arSupported = useARSupport();
 
   const addLog = (msg, type = "info") =>
     setLog((p) => [{ msg, type, id: Date.now() }, ...p].slice(0, 8));
-
   const setInput = (k, v) => setInputs((p) => ({ ...p, [k]: v }));
 
   const handleSelect = (idx) => {
@@ -975,13 +1000,12 @@ export default function GroceryShelf() {
     const idx = +inputs.insertIdx;
     if (idx < 0 || idx > items.length)
       return addLog("⚠️ Index out of bounds!", "error");
-    const shifted = items.length - idx;
     const next = [...items];
     next.splice(idx, 0, inputs.insertProduct);
     setItems(next.slice(0, INITIAL_ITEMS.length));
     setSelectedIndex(idx);
     addLog(
-      `➕ Insert "${inputs.insertProduct}" at [${idx}]  ·  Shifted ${shifted} right  ·  O(n)`,
+      `➕ Insert "${inputs.insertProduct}" at [${idx}]  ·  Shifted ${items.length - idx} right  ·  O(n)`,
       "success",
     );
   };
@@ -1018,12 +1042,12 @@ export default function GroceryShelf() {
     setLog([]);
   };
 
-  // ── AR flow ──
   const handleEnterAR = useCallback(async () => {
     setPlaceState(PS.SCANNING);
     setAnchorPos(null);
-    setHitPos(null);
-    // Must include hit-test in required features
+    hitPosRef.current = null;
+    hitMatrixRef.current = null;
+    setHasHit(false);
     await xrStore.enterAR({ requiredFeatures: ["local", "hit-test"] });
     setIsAR(true);
   }, []);
@@ -1035,32 +1059,33 @@ export default function GroceryShelf() {
     setIsAR(false);
     setPlaceState(PS.SCANNING);
     setAnchorPos(null);
-    setHitPos(null);
+    hitPosRef.current = null;
+    hitMatrixRef.current = null;
+    setHasHit(false);
   }, []);
 
-  // Every frame callback — updates live hit position
-  const handleHitPos = useCallback((pos) => setHitPos(pos), []);
-  const handleNoHit = useCallback(() => setHitPos(null), []);
-
-  // Screen tap while scanning → snapshot the current hitPos as preview anchor
-  const handleTap = useCallback(() => {
-    // Use functional updater to safely read latest hitPos without stale closure
-    setHitPos((current) => {
-      if (current) {
-        setAnchorPos(current.clone());
-        setPlaceState(PS.PREVIEWING);
-      }
-      return current;
-    });
+  // Called from ShelfScene/ARCore when hit-test updates — update ref AND hasHit state
+  const handleHitUpdate = useCallback((matrix) => {
+    hitMatrixRef.current = matrix;
+    const m = new THREE.Matrix4().fromArray(matrix);
+    const pos = new THREE.Vector3();
+    m.decompose(pos, new THREE.Quaternion(), new THREE.Vector3());
+    hitPosRef.current = pos;
+    setHasHit(true);
   }, []);
 
-  // Confirm → lock the shelf
+  const handleNoHit = useCallback(() => {
+    hitMatrixRef.current = null;
+    hitPosRef.current = null;
+    setHasHit(false);
+  }, []);
+
   const handleConfirm = useCallback(() => setPlaceState(PS.CONFIRMED), []);
-
-  // Re-place → go back to scanning
   const handleReplace = useCallback(() => {
     setAnchorPos(null);
-    setHitPos(null);
+    hitPosRef.current = null;
+    hitMatrixRef.current = null;
+    setHasHit(false);
     setPlaceState(PS.SCANNING);
   }, []);
 
@@ -1086,7 +1111,7 @@ export default function GroceryShelf() {
       <ARHud
         isAR={isAR}
         placeState={placeState}
-        hasHit={!!hitPos}
+        hasHit={hasHit}
         onConfirm={handleConfirm}
         onReplace={handleReplace}
         onExit={handleExitAR}
@@ -1167,9 +1192,12 @@ export default function GroceryShelf() {
               isAR={isAR}
               placeState={placeState}
               anchorPos={anchorPos}
-              onHitPos={handleHitPos}
+              hitPosRef={hitPosRef}
+              hitMatrixRef={hitMatrixRef}
+              setPlaceState={setPlaceState}
+              setAnchorPos={setAnchorPos}
+              onHitUpdate={handleHitUpdate}
               onNoHit={handleNoHit}
-              onTap={handleTap}
             />
           </XR>
         </Canvas>
