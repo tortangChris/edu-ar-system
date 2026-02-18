@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import {
   Text,
@@ -42,21 +42,151 @@ const INITIAL_ITEMS = [
   "bread",
 ];
 
-// ─── Reticle mesh ─────────────────────────────────────────────────────────────
-function Reticle({ reticleRef }) {
+// ─── Raw WebXR Session Manager ────────────────────────────────────────────────
+// Mirrors the Immersive Web hit-test sample exactly.
+// No @react-three/xr — direct navigator.xr API calls.
+class XRSessionManager {
+  constructor() {
+    this.session = null;
+    this.refSpace = null; // 'local'
+    this.viewerSpace = null; // 'viewer' — for hit-test ray origin
+    this.hitTestSource = null;
+    this.hitMatrix = null; // latest THREE.Matrix4 from hit-test
+    this.isActive = false;
+    this.onHit = null; // (matrix: THREE.Matrix4 | null) => void
+    this.onEnd = null; // () => void
+    this.onSelect = null; // (matrix: THREE.Matrix4) => void — tap to place
+  }
+
+  async start(gl) {
+    // 1. Check API availability
+    if (!navigator.xr) throw new Error("WebXR not available on this browser.");
+
+    const supported = await navigator.xr.isSessionSupported("immersive-ar");
+    if (!supported)
+      throw new Error("immersive-ar not supported on this device.");
+
+    // 2. Camera permission — explicit request before session (avoids silent denial)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+      });
+      stream.getTracks().forEach((t) => t.stop()); // release — WebXR takes over camera
+    } catch (err) {
+      if (err.name === "NotAllowedError") {
+        throw new Error(
+          "Camera access was denied. Please tap 'Allow' when prompted and try again.",
+        );
+      }
+      throw new Error("Could not access camera: " + err.message);
+    }
+
+    // 3. Make the existing WebGL context XR-compatible
+    await gl.getContext().makeXRCompatible?.();
+
+    // 4. Request AR session — same flags as the working Immersive Web sample
+    this.session = await navigator.xr.requestSession("immersive-ar", {
+      requiredFeatures: ["local", "hit-test"],
+      optionalFeatures: ["dom-overlay"],
+      domOverlay: { root: document.getElementById("ar-overlay") },
+    });
+
+    // 5. Bind session to the existing R3F canvas gl context
+    const baseLayer = new XRWebGLLayer(this.session, gl.getContext());
+    this.session.updateRenderState({ baseLayer });
+
+    // 6. Session lifecycle
+    this.session.addEventListener("end", () => {
+      this.hitTestSource = null;
+      this.session = null;
+      this.refSpace = null;
+      this.viewerSpace = null;
+      this.hitMatrix = null;
+      this.isActive = false;
+      this.onEnd?.();
+    });
+
+    // 7. Tap → place (one-time, matches sample's onSelect)
+    this.session.addEventListener("select", () => {
+      if (this.hitMatrix && this.onSelect) {
+        this.onSelect(this.hitMatrix.clone());
+      }
+    });
+
+    // 8. Setup reference spaces — same as sample
+    this.viewerSpace = await this.session.requestReferenceSpace("viewer");
+    this.hitTestSource = await this.session.requestHitTestSource({
+      space: this.viewerSpace,
+    });
+    this.refSpace = await this.session.requestReferenceSpace("local");
+
+    this.isActive = true;
+    return this.session;
+  }
+
+  // Called every frame from R3F's useFrame loop
+  processFrame(frame) {
+    if (!this.hitTestSource || !this.refSpace || !frame) return;
+
+    const results = frame.getHitTestResults(this.hitTestSource);
+    if (results.length > 0) {
+      const pose = results[0].getPose(this.refSpace);
+      if (pose) {
+        this.hitMatrix = new THREE.Matrix4().fromArray(pose.transform.matrix);
+        this.onHit?.(this.hitMatrix);
+        return;
+      }
+    }
+    // No surface detected
+    this.hitMatrix = null;
+    this.onHit?.(null);
+  }
+
+  end() {
+    this.hitTestSource?.cancel();
+    this.hitTestSource = null;
+    this.session?.end();
+  }
+}
+
+// Singleton — survives re-renders
+const xrManager = new XRSessionManager();
+
+// ─── Reticle (ring on detected surface) ──────────────────────────────────────
+// Positioned via raw hit-test matrix — same approach as the sample's reticle.gltf
+function Reticle({ hitMatrix }) {
+  const ref = useRef();
+
+  useEffect(() => {
+    if (!ref.current) return;
+    if (hitMatrix) {
+      ref.current.visible = true;
+      ref.current.matrix.copy(hitMatrix);
+      ref.current.matrix.decompose(
+        ref.current.position,
+        ref.current.quaternion,
+        ref.current.scale,
+      );
+    } else {
+      ref.current.visible = false;
+    }
+  }, [hitMatrix]);
+
   return (
-    <group ref={reticleRef} visible={false} matrixAutoUpdate={false}>
+    <group ref={ref} visible={false} matrixAutoUpdate={false}>
+      {/* Outer ring */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[0.1, 0.14, 36]} />
+        <ringGeometry args={[0.09, 0.13, 32]} />
         <meshBasicMaterial
           color="#f39c12"
           transparent
-          opacity={0.95}
+          opacity={0.92}
           side={THREE.DoubleSide}
         />
       </mesh>
+      {/* Pulse ring */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[0.17, 0.19, 36]} />
+        <ringGeometry args={[0.16, 0.175, 32]} />
         <meshBasicMaterial
           color="#f39c12"
           transparent
@@ -64,12 +194,13 @@ function Reticle({ reticleRef }) {
           side={THREE.DoubleSide}
         />
       </mesh>
+      {/* Center dot */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
         <circleGeometry args={[0.025, 16]} />
         <meshBasicMaterial
-          color="#ffffff"
+          color="#fff"
           transparent
-          opacity={0.9}
+          opacity={0.85}
           side={THREE.DoubleSide}
         />
       </mesh>
@@ -77,130 +208,26 @@ function Reticle({ reticleRef }) {
   );
 }
 
-// ─── THE FIX: WebXR session starter — lives INSIDE Canvas so it has R3F gl access
-//
-//  The Immersive Web sample works because it owns its own WebGL context from the start.
-//  In R3F, the renderer already owns the canvas/context — so we MUST go through
-//  renderer.xr (Three.js's built-in WebXRManager) instead of creating a new XRWebGLLayer.
-//
-//  renderer.xr.setSession(session) is the correct bridge:
-//    • Three.js handles XRWebGLLayer creation internally
-//    • R3F's useFrame loop automatically becomes the XR frame loop
-//    • No context conflict, no separate RAF loop
-//
-function ARSessionManager({
-  onSessionReady,
-  onSessionEnd,
-  reticleRef,
-  onHitResult,
-  onNoHit,
-}) {
-  const { gl } = useThree(); // gl = THREE.WebGLRenderer — already owns the canvas
+// ─── XR Frame Bridge — feeds raw WebXR frames into R3F loop ──────────────────
+function XRFrameBridge({ isAR, onHitMatrix }) {
+  const { gl } = useThree();
 
   useEffect(() => {
-    let hitTestSource = null;
-    let localRefSpace = null;
-    let viewerRefSpace = null;
-    let session = null;
-
-    async function startAR() {
-      try {
-        // Step 1: request session — same requiredFeatures as Immersive Web sample
-        session = await navigator.xr.requestSession("immersive-ar", {
-          requiredFeatures: ["local", "hit-test"],
-          optionalFeatures: ["dom-overlay"],
-          domOverlay: { root: document.getElementById("ar-overlay") },
-        });
-
-        // Step 2: THE KEY FIX
-        // Instead of: new XRWebGLLayer(session, gl.getContext()) ← conflict
-        // We do:      renderer.xr.setSession(session)           ← R3F-native
-        // Three.js handles the baseLayer internally, R3F frame loop becomes XR loop
-        await gl.xr.setSession(session);
-        gl.xr.enabled = true;
-
-        // Step 3: reference spaces — same as Immersive Web sample
-        viewerRefSpace = await session.requestReferenceSpace("viewer");
-        localRefSpace = await session.requestReferenceSpace("local");
-
-        // Step 4: hit-test source from viewer space (ray from camera center)
-        hitTestSource = await session.requestHitTestSource({
-          space: viewerRefSpace,
-        });
-
-        session.addEventListener("end", () => {
-          hitTestSource = null;
-          localRefSpace = null;
-          hitTestSource = null;
-          gl.xr.enabled = false;
-          onSessionEnd();
-        });
-
-        // Expose to parent via callback
-        onSessionReady({
-          getHitResults: (frame) => {
-            if (!hitTestSource || !localRefSpace) return [];
-            return {
-              hits: frame.getHitTestResults(hitTestSource),
-              refSpace: localRefSpace,
-            };
-          },
-          endSession: () => session.end(),
-        });
-      } catch (err) {
-        console.error("WebXR session error:", err);
-        // Detailed error so we know WHAT actually failed
-        onSessionEnd({ error: err.message || err.name || String(err) });
-      }
-    }
-
-    startAR();
-
+    if (isAR) gl.xr.enabled = true;
     return () => {
-      if (session) {
-        try {
-          session.end();
-        } catch (_) {}
-      }
+      gl.xr.enabled = false;
     };
-  }, []);
+  }, [isAR, gl]);
 
-  // R3F's useFrame IS the XR frame loop once renderer.xr.setSession() is called
-  // This mirrors onXRFrame() from the Immersive Web sample
-  useFrame((state, delta, xrFrame) => {
-    if (!xrFrame || !reticleRef.current) return;
-
-    // xrFrame = the live XRFrame — same as the `frame` arg in sample's onXRFrame
-    const sessionAPI = state.gl.xr;
-    if (!sessionAPI?.isPresenting) return;
-
-    // Get hit test results for this frame
-    const result = onHitResult(xrFrame);
-    if (!result) return;
-
-    const { hits, refSpace } = result;
-
-    if (hits && hits.length > 0) {
-      const hitPose = hits[0].getPose(refSpace);
-      if (hitPose) {
-        // Apply hit pose matrix to reticle — identical to sample:
-        // reticle.visible = true; reticle.matrix = pose.transform.matrix;
-        reticleRef.current.visible = true;
-        reticleRef.current.matrix.fromArray(hitPose.transform.matrix);
-        reticleRef.current.matrix.decompose(
-          reticleRef.current.position,
-          reticleRef.current.quaternion,
-          reticleRef.current.scale,
-        );
-        onNoHit(false, hitPose.transform.matrix);
-      }
-    } else {
-      reticleRef.current.visible = false;
-      onNoHit(true, null);
+  useFrame((state) => {
+    if (!isAR || !xrManager.isActive) return;
+    const frame = state.gl.xr.getFrame?.();
+    if (frame) {
+      xrManager.processFrame(frame);
     }
   });
 
-  return null; // no visual output — just manages session lifecycle
+  return null;
 }
 
 // ─── Single Grocery Box ───────────────────────────────────────────────────────
@@ -226,9 +253,15 @@ function GroceryBox({ position, index, product, isSelected, onClick }) {
 
   useFrame((state) => {
     if (!boxRef.current) return;
-    boxRef.current.rotation.y = isSelected
-      ? Math.sin(state.clock.elapsedTime * 2) * 0.15
-      : THREE.MathUtils.lerp(boxRef.current.rotation.y, 0, 0.1);
+    if (isSelected) {
+      boxRef.current.rotation.y = Math.sin(state.clock.elapsedTime * 2) * 0.15;
+    } else {
+      boxRef.current.rotation.y = THREE.MathUtils.lerp(
+        boxRef.current.rotation.y,
+        0,
+        0.1,
+      );
+    }
   });
 
   return (
@@ -349,37 +382,13 @@ function ShelfFrame({ height, width }) {
   );
 }
 
-// ─── Full scene ───────────────────────────────────────────────────────────────
-function ShelfScene({
-  items,
-  selectedIndex,
-  onSelect,
-  isAR,
-  startAR,
-  arActive,
-  placedMatrix,
-  reticleRef,
-  onSessionReady,
-  onSessionEnd,
-  onHitResult,
-  onNoHit,
-}) {
+// ─── Shelf Group — handles both normal and AR positioning ────────────────────
+function ShelfContents({ items, selectedIndex, onSelect }) {
   const ITEM_W = 0.95;
   const ROW = Math.ceil(items.length / 2);
   const SHELF_Y = [-0.3, 1.15];
   const row0 = items.slice(0, ROW);
   const row1 = items.slice(ROW);
-  const shelfRef = useRef();
-  const AR_SCALE = 0.28;
-
-  // Apply world-pose matrix to shelf on placement
-  useEffect(() => {
-    if (!placedMatrix || !shelfRef.current) return;
-    const m = new THREE.Matrix4().fromArray(placedMatrix);
-    m.scale(new THREE.Vector3(AR_SCALE, AR_SCALE, AR_SCALE));
-    shelfRef.current.matrix.copy(m);
-    shelfRef.current.matrixAutoUpdate = false;
-  }, [placedMatrix]);
 
   const renderRow = (row, startIdx, shelfY) =>
     row.map((product, i) => (
@@ -395,10 +404,46 @@ function ShelfScene({
 
   return (
     <>
+      <ShelfFrame height={2.4} width={ROW * ITEM_W} />
+      <ShelfBoard y={SHELF_Y[0]} width={ROW * ITEM_W} />
+      <ShelfBoard y={SHELF_Y[1]} width={ROW * ITEM_W} />
+      {renderRow(row0, 0, SHELF_Y[0])}
+      {renderRow(row1, ROW, SHELF_Y[1])}
+    </>
+  );
+}
+
+function ShelfScene({
+  items,
+  selectedIndex,
+  onSelect,
+  isAR,
+  placedMatrix,
+  hitMatrix,
+}) {
+  const ITEM_W = 0.95;
+  const ROW = Math.ceil(items.length / 2);
+  const AR_SCALE = 0.28;
+
+  // AR anchor group — positioned once when user taps
+  const anchorRef = useRef();
+
+  useEffect(() => {
+    if (!anchorRef.current || !placedMatrix) return;
+    placedMatrix.decompose(
+      anchorRef.current.position,
+      anchorRef.current.quaternion,
+      anchorRef.current.scale,
+    );
+    anchorRef.current.scale.set(AR_SCALE, AR_SCALE, AR_SCALE);
+  }, [placedMatrix]);
+
+  return (
+    <>
       <ambientLight intensity={isAR ? 1.2 : 0.6} />
       <directionalLight
         position={[5, 8, 5]}
-        intensity={isAR ? 0.7 : 1.2}
+        intensity={isAR ? 0.6 : 1.2}
         castShadow
       />
       <directionalLight
@@ -408,28 +453,31 @@ function ShelfScene({
       />
       <pointLight position={[0, 3, 2]} intensity={0.5} color="#fff5e0" />
 
-      {/* AR session manager — mounted inside Canvas, uses R3F's gl.xr */}
-      {startAR && (
-        <ARSessionManager
-          onSessionReady={onSessionReady}
-          onSessionEnd={onSessionEnd}
-          reticleRef={reticleRef}
-          onHitResult={onHitResult}
-          onNoHit={onNoHit}
-        />
+      {/* Hooks raw WebXR frame into R3F loop */}
+      <XRFrameBridge isAR={isAR} />
+
+      {/* Reticle — visible before placement */}
+      {isAR && !placedMatrix && <Reticle hitMatrix={hitMatrix} />}
+
+      {/* Normal 3D mode shelf */}
+      {!isAR && (
+        <group position={[0, -0.6, 0]}>
+          <ShelfContents
+            items={items}
+            selectedIndex={selectedIndex}
+            onSelect={onSelect}
+          />
+        </group>
       )}
 
-      {/* Reticle — shown in AR scanning phase */}
-      {isAR && <Reticle reticleRef={reticleRef} />}
-
-      {/* Shelf */}
-      {(!isAR || placedMatrix) && (
-        <group ref={shelfRef} {...(!isAR ? { position: [0, -0.6, 0] } : {})}>
-          <ShelfFrame height={2.4} width={ROW * ITEM_W} />
-          <ShelfBoard y={SHELF_Y[0]} width={ROW * ITEM_W} />
-          <ShelfBoard y={SHELF_Y[1]} width={ROW * ITEM_W} />
-          {renderRow(row0, 0, SHELF_Y[0])}
-          {renderRow(row1, ROW, SHELF_Y[1])}
+      {/* AR mode shelf — placed at tapped anchor */}
+      {isAR && placedMatrix && (
+        <group ref={anchorRef}>
+          <ShelfContents
+            items={items}
+            selectedIndex={selectedIndex}
+            onSelect={onSelect}
+          />
         </group>
       )}
 
@@ -450,13 +498,10 @@ function ShelfScene({
   );
 }
 
-// ─── AR DOM Overlay ───────────────────────────────────────────────────────────
+// ─── AR Overlay HUD (dom-overlay so it shows over camera feed) ───────────────
 function AROverlay({
-  isAR,
-  reticleVisible,
-  placed,
-  onPlace,
-  onExit,
+  placedMatrix,
+  hasHit,
   items,
   selectedIndex,
   activeTab,
@@ -469,11 +514,10 @@ function AROverlay({
   onReset,
   setInput,
   setActiveTab,
-  arError,
+  onExit,
 }) {
-  if (!isAR) return null;
-
   return (
+    // id="ar-overlay" is passed as domOverlay root to the XR session
     <div
       id="ar-overlay"
       style={{
@@ -484,156 +528,75 @@ function AROverlay({
         fontFamily: "'Courier New', monospace",
       }}
     >
-      {/* Error state */}
-      {arError && (
+      {/* ── Scanning / pre-placement state ── */}
+      {!placedMatrix && (
         <div
           style={{
             position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: "translate(-50%,-50%)",
-            background: "rgba(0,0,0,0.9)",
-            border: "1px solid rgba(231,76,60,0.5)",
-            borderRadius: 16,
-            padding: "20px 24px",
-            textAlign: "center",
-            maxWidth: 300,
-            pointerEvents: "auto",
-          }}
-        >
-          <div style={{ fontSize: 32, marginBottom: 8 }}>⚠️</div>
-          <div
-            style={{
-              color: "#e74c3c",
-              fontWeight: "bold",
-              fontSize: 14,
-              marginBottom: 8,
-            }}
-          >
-            AR Session Failed
-          </div>
-          <div
-            style={{
-              color: "rgba(255,255,255,0.6)",
-              fontSize: 11,
-              marginBottom: 16,
-              wordBreak: "break-word",
-            }}
-          >
-            {arError}
-          </div>
-          <button
-            onClick={onExit}
-            style={{
-              background: "rgba(255,255,255,0.1)",
-              border: "1px solid rgba(255,255,255,0.2)",
-              borderRadius: 8,
-              padding: "8px 20px",
-              color: "#fff",
-              cursor: "pointer",
-            }}
-          >
-            Close
-          </button>
-        </div>
-      )}
-
-      {/* Scanning phase */}
-      {!placed && !arError && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: 0,
+            bottom: 80,
             left: 0,
             right: 0,
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            paddingBottom: 52,
-            gap: 14,
+            gap: 12,
             pointerEvents: "auto",
           }}
         >
           <div
             style={{
-              background: "rgba(0,0,0,0.75)",
-              border: `1px solid ${reticleVisible ? "rgba(46,204,113,0.5)" : "rgba(243,156,18,0.4)"}`,
+              background: "rgba(0,0,0,0.72)",
+              border: "1px solid rgba(243,156,18,0.5)",
               borderRadius: 14,
-              padding: "11px 24px",
+              padding: "12px 24px",
+              color: "#f39c12",
+              fontSize: 14,
+              fontWeight: "bold",
               textAlign: "center",
             }}
           >
+            {hasHit ? "🎯 Surface detected!" : "📷 Scanning for surface..."}
             <div
               style={{
-                color: reticleVisible ? "#2ecc71" : "#f39c12",
-                fontWeight: "bold",
-                fontSize: 14,
+                color: "rgba(255,255,255,0.55)",
+                fontSize: 12,
+                fontWeight: "normal",
+                marginTop: 4,
               }}
             >
-              {reticleVisible
-                ? "✅ Surface detected!"
-                : "🔍 Scanning for flat surface…"}
-            </div>
-            <div
-              style={{
-                color: "rgba(255,255,255,0.5)",
-                fontSize: 11,
-                marginTop: 3,
-              }}
-            >
-              {reticleVisible
-                ? "Tap the button below to place the shelf"
-                : "Point camera at a table or floor and move slowly"}
+              {hasHit
+                ? "Tap the screen to place the shelf"
+                : "Move your phone slowly over a flat table or floor"}
             </div>
           </div>
-
-          {reticleVisible && (
-            <button
-              onClick={onPlace}
-              style={{
-                background: "linear-gradient(135deg,#f39c12,#e67e22)",
-                border: "none",
-                borderRadius: 50,
-                padding: "15px 38px",
-                color: "#1a1a1a",
-                fontWeight: "bold",
-                fontSize: 17,
-                cursor: "pointer",
-                boxShadow: "0 0 30px rgba(243,156,18,0.6)",
-                fontFamily: "'Courier New', monospace",
-              }}
-            >
-              📦 Place Shelf Here
-            </button>
-          )}
-
           <button
             onClick={onExit}
             style={{
-              background: "rgba(0,0,0,0.65)",
+              background: "rgba(0,0,0,0.6)",
               border: "1px solid rgba(255,255,255,0.2)",
               borderRadius: 10,
-              padding: "8px 22px",
-              color: "rgba(255,255,255,0.6)",
-              fontSize: 12,
+              padding: "8px 20px",
+              color: "rgba(255,255,255,0.7)",
+              fontSize: 13,
               cursor: "pointer",
             }}
           >
-            ✕ Cancel AR
+            ✕ Cancel
           </button>
         </div>
       )}
 
-      {/* Placed: operation HUD */}
-      {placed && !arError && (
+      {/* ── After placement: full operation HUD ── */}
+      {placedMatrix && (
         <>
+          {/* Top info bar */}
           <div
             style={{
               position: "absolute",
-              top: 14,
-              left: 14,
-              right: 14,
-              background: "rgba(0,0,0,0.75)",
+              top: 16,
+              left: 16,
+              right: 16,
+              background: "rgba(0,0,0,0.78)",
               border: "1px solid rgba(243,156,18,0.3)",
               borderRadius: 12,
               padding: "8px 14px",
@@ -648,21 +611,23 @@ function AROverlay({
             >
               🛒 GROCERY SHELF — AR
             </span>
-            <span style={{ color: "rgba(255,255,255,0.5)", fontSize: 11 }}>
+            <span style={{ color: "rgba(255,255,255,0.55)", fontSize: 11 }}>
               Array[{items.length}]
               {selectedIndex !== null ? ` · [${selectedIndex}]` : ""}
             </span>
           </div>
 
+          {/* Tabs */}
           <div
             style={{
               position: "absolute",
-              bottom: 218,
-              left: 14,
-              right: 14,
+              bottom: 190,
+              left: 16,
+              right: 16,
               display: "flex",
-              gap: 7,
+              gap: 6,
               justifyContent: "center",
+              flexWrap: "wrap",
               pointerEvents: "auto",
             }}
           >
@@ -671,38 +636,38 @@ function AROverlay({
               ["insert", "➕", "Insert"],
               ["delete", "🗑️", "Delete"],
               ["update", "✏️", "Update"],
-            ].map(([tab, emoji, label]) => (
+            ].map(([tab, icon, label]) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
                 style={{
-                  padding: "8px 13px",
+                  padding: "8px 14px",
                   borderRadius: 10,
                   fontSize: 12,
                   fontWeight: "bold",
                   border: "2px solid",
                   cursor: "pointer",
-                  fontFamily: "monospace",
                   background:
                     activeTab === tab ? "#f39c12" : "rgba(0,0,0,0.78)",
                   borderColor:
                     activeTab === tab ? "#f39c12" : "rgba(255,255,255,0.2)",
                   color:
-                    activeTab === tab ? "#1a1a1a" : "rgba(255,255,255,0.75)",
+                    activeTab === tab ? "#1a1a1a" : "rgba(255,255,255,0.78)",
                 }}
               >
-                {emoji} {label}
+                {icon} {label}
               </button>
             ))}
           </div>
 
+          {/* Operation panel */}
           <div
             style={{
               position: "absolute",
-              bottom: 82,
-              left: 14,
-              right: 14,
-              background: "rgba(0,0,0,0.85)",
+              bottom: 80,
+              left: 16,
+              right: 16,
+              background: "rgba(0,0,0,0.84)",
               border: "1px solid rgba(255,255,255,0.1)",
               borderRadius: 14,
               padding: "14px 16px",
@@ -710,71 +675,126 @@ function AROverlay({
             }}
           >
             {activeTab === "access" && (
-              <HudRow>
-                <HudLabel>Index</HudLabel>
-                <HudNum
-                  value={inputs.accessIdx}
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={lbl}>Index</span>
+                <input
+                  type="number"
+                  min={0}
                   max={items.length - 1}
-                  onChange={(v) => setInput("accessIdx", v)}
+                  value={inputs.accessIdx}
+                  onChange={(e) => setInput("accessIdx", e.target.value)}
+                  style={inp}
                 />
-                <HudBtn color="#2980b9" onClick={onAccess}>
-                  Access <Bdg green>O(1)</Bdg>
-                </HudBtn>
-              </HudRow>
+                <button
+                  onClick={onAccess}
+                  style={{ ...btn, background: "#2980b9" }}
+                >
+                  Access{" "}
+                  <span style={{ color: "#7fe0a0", fontSize: 10 }}>O(1)</span>
+                </button>
+              </div>
             )}
             {activeTab === "insert" && (
-              <HudRow wrap>
-                <HudLabel>Index</HudLabel>
-                <HudNum
-                  value={inputs.insertIdx}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span style={lbl}>Index</span>
+                <input
+                  type="number"
+                  min={0}
                   max={items.length}
-                  onChange={(v) => setInput("insertIdx", v)}
+                  value={inputs.insertIdx}
+                  onChange={(e) => setInput("insertIdx", e.target.value)}
+                  style={inp}
                 />
-                <HudSel
+                <select
                   value={inputs.insertProduct}
-                  onChange={(v) => setInput("insertProduct", v)}
-                />
-                <HudBtn color="#27ae60" onClick={onInsert}>
-                  Insert <Bdg>O(n)</Bdg>
-                </HudBtn>
-              </HudRow>
+                  onChange={(e) => setInput("insertProduct", e.target.value)}
+                  style={sel}
+                >
+                  {PRODUCTS.map((p) => (
+                    <option key={p} value={p}>
+                      {PRODUCT_EMOJIS[p]} {p}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={onInsert}
+                  style={{ ...btn, background: "#27ae60" }}
+                >
+                  Insert{" "}
+                  <span style={{ color: "#ffaaaa", fontSize: 10 }}>O(n)</span>
+                </button>
+              </div>
             )}
             {activeTab === "delete" && (
-              <HudRow>
-                <HudLabel>Index</HudLabel>
-                <HudNum
-                  value={inputs.deleteIdx}
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={lbl}>Index</span>
+                <input
+                  type="number"
+                  min={0}
                   max={items.length - 1}
-                  onChange={(v) => setInput("deleteIdx", v)}
+                  value={inputs.deleteIdx}
+                  onChange={(e) => setInput("deleteIdx", e.target.value)}
+                  style={inp}
                 />
-                <HudBtn color="#c0392b" onClick={onDelete}>
-                  Delete <Bdg>O(n)</Bdg>
-                </HudBtn>
-              </HudRow>
+                <button
+                  onClick={onDelete}
+                  style={{ ...btn, background: "#c0392b" }}
+                >
+                  Delete{" "}
+                  <span style={{ color: "#ffaaaa", fontSize: 10 }}>O(n)</span>
+                </button>
+              </div>
             )}
             {activeTab === "update" && (
-              <HudRow wrap>
-                <HudLabel>Replace with</HudLabel>
-                <HudSel
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span style={lbl}>Replace with</span>
+                <select
                   value={inputs.updateProduct}
-                  onChange={(v) => setInput("updateProduct", v)}
-                />
-                <HudBtn
-                  color={selectedIndex === null ? "#555" : "#8e44ad"}
-                  disabled={selectedIndex === null}
-                  onClick={onUpdate}
+                  onChange={(e) => setInput("updateProduct", e.target.value)}
+                  style={sel}
                 >
-                  Update [{selectedIndex ?? "?"}] <Bdg green>O(1)</Bdg>
-                </HudBtn>
-              </HudRow>
+                  {PRODUCTS.map((p) => (
+                    <option key={p} value={p}>
+                      {PRODUCT_EMOJIS[p]} {p}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={onUpdate}
+                  disabled={selectedIndex === null}
+                  style={{
+                    ...btn,
+                    background: selectedIndex === null ? "#444" : "#8e44ad",
+                    cursor: selectedIndex === null ? "not-allowed" : "pointer",
+                  }}
+                >
+                  Update [{selectedIndex ?? "?"}]{" "}
+                  <span style={{ color: "#7fe0a0", fontSize: 10 }}>O(1)</span>
+                </button>
+              </div>
             )}
             {log.length > 0 && (
               <div
                 style={{
-                  marginTop: 9,
+                  marginTop: 8,
                   paddingTop: 8,
-                  borderTop: "1px solid rgba(255,255,255,0.08)",
+                  borderTop: "1px solid rgba(255,255,255,0.1)",
                   fontSize: 11,
+                  fontFamily: "monospace",
                   color:
                     log[0].type === "success"
                       ? "#7fe0a0"
@@ -788,12 +808,13 @@ function AROverlay({
             )}
           </div>
 
+          {/* Bottom controls */}
           <div
             style={{
               position: "absolute",
               bottom: 20,
-              left: 14,
-              right: 14,
+              left: 16,
+              right: 16,
               display: "flex",
               gap: 8,
               pointerEvents: "auto",
@@ -801,13 +822,13 @@ function AROverlay({
           >
             <button
               onClick={onReset}
-              style={{ ...B, background: "rgba(255,255,255,0.12)", flex: 1 }}
+              style={{ ...btn, background: "rgba(255,255,255,0.1)", flex: 1 }}
             >
               🔄 Reset
             </button>
             <button
               onClick={onExit}
-              style={{ ...B, background: "rgba(180,30,30,0.78)", flex: 1 }}
+              style={{ ...btn, background: "rgba(180,30,30,0.78)", flex: 1 }}
             >
               ✕ Exit AR
             </button>
@@ -818,98 +839,34 @@ function AROverlay({
   );
 }
 
-// ── Micro UI atoms ──
-const B = {
-  padding: "9px 14px",
-  borderRadius: 9,
+const lbl = { color: "rgba(255,255,255,0.6)", fontSize: 13 };
+const inp = {
+  width: 60,
+  padding: "6px 10px",
+  background: "rgba(0,0,0,0.55)",
+  border: "1px solid rgba(255,255,255,0.2)",
+  borderRadius: 8,
+  color: "#f39c12",
+  fontFamily: "monospace",
+  fontSize: 13,
+};
+const btn = {
+  padding: "8px 14px",
+  borderRadius: 8,
   border: "none",
   color: "#fff",
   fontWeight: "bold",
   fontSize: 13,
   cursor: "pointer",
-  fontFamily: "monospace",
 };
-const HudRow = ({ children, wrap }) => (
-  <div
-    style={{
-      display: "flex",
-      alignItems: "center",
-      gap: 8,
-      flexWrap: wrap ? "wrap" : "nowrap",
-    }}
-  >
-    {children}
-  </div>
-);
-const HudLabel = ({ children }) => (
-  <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
-    {children}
-  </span>
-);
-const Bdg = ({ children, green }) => (
-  <span
-    style={{
-      color: green ? "#7fe0a0" : "#ff9e9e",
-      fontSize: 10,
-      marginLeft: 2,
-    }}
-  >
-    {children}
-  </span>
-);
-const HudBtn = ({ children, color, onClick, disabled }) => (
-  <button
-    onClick={onClick}
-    disabled={disabled}
-    style={{
-      ...B,
-      background: color,
-      opacity: disabled ? 0.45 : 1,
-      cursor: disabled ? "not-allowed" : "pointer",
-    }}
-  >
-    {children}
-  </button>
-);
-const HudNum = ({ value, onChange, max }) => (
-  <input
-    type="number"
-    min={0}
-    max={max}
-    value={value}
-    onChange={(e) => onChange(e.target.value)}
-    style={{
-      width: 56,
-      padding: "6px 9px",
-      background: "rgba(0,0,0,0.5)",
-      border: "1px solid rgba(255,255,255,0.2)",
-      borderRadius: 8,
-      color: "#f39c12",
-      fontFamily: "monospace",
-      fontSize: 13,
-    }}
-  />
-);
-const HudSel = ({ value, onChange }) => (
-  <select
-    value={value}
-    onChange={(e) => onChange(e.target.value)}
-    style={{
-      padding: "6px 9px",
-      background: "rgba(0,0,0,0.5)",
-      border: "1px solid rgba(255,255,255,0.2)",
-      borderRadius: 8,
-      color: "#fff",
-      fontSize: 13,
-    }}
-  >
-    {PRODUCTS.map((p) => (
-      <option key={p} value={p}>
-        {PRODUCT_EMOJIS[p]} {p}
-      </option>
-    ))}
-  </select>
-);
+const sel = {
+  padding: "6px 10px",
+  background: "rgba(0,0,0,0.55)",
+  border: "1px solid rgba(255,255,255,0.2)",
+  borderRadius: 8,
+  color: "#fff",
+  fontSize: 13,
+};
 
 // ─── Main Export ──────────────────────────────────────────────────────────────
 export default function GroceryShelf() {
@@ -926,88 +883,22 @@ export default function GroceryShelf() {
   });
 
   // AR state
-  const [arSupported, setArSupported] = useState(null);
-  const [startAR, setStartAR] = useState(false); // mounts ARSessionManager inside Canvas
-  const [isAR, setIsAR] = useState(false); // true = session active
-  const [reticleVisible, setReticleVisible] = useState(false);
-  const [placedMatrix, setPlacedMatrix] = useState(null);
+  const [isAR, setIsAR] = useState(false);
+  const [placedMatrix, setPlacedMatrix] = useState(null); // THREE.Matrix4
+  const [hitMatrix, setHitMatrix] = useState(null); // live reticle matrix
   const [arError, setArError] = useState(null);
+  const [arStarting, setArStarting] = useState(false);
 
-  const reticleRef = useRef();
-  const latestHitRef = useRef(null);
-  const sessionApiRef = useRef(null); // { endSession, getHitResults }
-
-  useEffect(() => {
-    if (!navigator.xr) {
-      setArSupported(false);
-      return;
-    }
-    navigator.xr
-      .isSessionSupported("immersive-ar")
-      .then(setArSupported)
-      .catch(() => setArSupported(false));
-  }, []);
-
-  // Called by ARSessionManager once session + hit-test source are ready
-  const handleSessionReady = useCallback((api) => {
-    sessionApiRef.current = api;
-    setIsAR(true);
-    setArError(null);
-  }, []);
-
-  // Called by ARSessionManager on session end or error
-  const handleSessionEnd = useCallback(({ error } = {}) => {
-    setIsAR(false);
-    setStartAR(false);
-    setPlacedMatrix(null);
-    setReticleVisible(false);
-    if (error) setArError(error);
-  }, []);
-
-  // Called every XR frame from ARSessionManager's useFrame
-  // Returns hit results to the frame loop (avoids stale closure issues)
-  const handleHitResult = useCallback((xrFrame) => {
-    if (!sessionApiRef.current) return null;
-    return sessionApiRef.current.getHitResults(xrFrame);
-  }, []);
-
-  // Called every frame with reticle visibility + latest hit matrix
-  const handleNoHit = useCallback((noHit, matrix) => {
-    setReticleVisible(!noHit);
-    latestHitRef.current = noHit ? null : matrix;
-  }, []);
-
-  // ONE-TIME placement — read latestHitRef synchronously
-  const handlePlace = useCallback(() => {
-    if (!latestHitRef.current) return;
-    setPlacedMatrix(new Float32Array(latestHitRef.current));
-    if (reticleRef.current) reticleRef.current.visible = false;
-    setReticleVisible(false);
-  }, []);
-
-  const handleEnterAR = useCallback(() => {
-    setArError(null);
-    setPlacedMatrix(null);
-    setReticleVisible(false);
-    setStartAR(true); // mounts <ARSessionManager> inside Canvas → starts session
-  }, []);
-
-  const handleExitAR = useCallback(() => {
-    if (sessionApiRef.current) sessionApiRef.current.endSession();
-    sessionApiRef.current = null;
-    setIsAR(false);
-    setStartAR(false);
-    setPlacedMatrix(null);
-    setReticleVisible(false);
-    setArError(null);
-  }, []);
+  // Keep a ref to the R3F gl object so XRSessionManager can use it
+  const glRef = useRef(null);
 
   const addLog = (msg, type = "info") =>
-    setLog((p) => [{ msg, type, id: Date.now() }, ...p].slice(0, 8));
-  const setInput = (key, val) => setInputs((p) => ({ ...p, [key]: val }));
+    setLog((prev) => [{ msg, type, id: Date.now() }, ...prev].slice(0, 8));
+  const setInput = (key, val) => setInputs((prev) => ({ ...prev, [key]: val }));
 
+  // DS operations — untouched
   const handleSelect = (idx) => {
-    setSelectedIndex((p) => (p === idx ? null : idx));
+    setSelectedIndex((prev) => (prev === idx ? null : idx));
     addLog(`Selected [${idx}] → "${items[idx]}"`, "select");
   };
   const handleAccess = () => {
@@ -1026,7 +917,7 @@ export default function GroceryShelf() {
     setItems(next.slice(0, INITIAL_ITEMS.length));
     setSelectedIndex(idx);
     addLog(
-      `➕ Insert "${inputs.insertProduct}" at [${idx}]  ·  Shifted ${items.length - idx}  ·  O(n)`,
+      `➕ Insert "${inputs.insertProduct}" at [${idx}]  ·  Shifted ${items.length - idx} right  ·  O(n)`,
       "success",
     );
   };
@@ -1040,16 +931,20 @@ export default function GroceryShelf() {
     next.push("empty");
     setItems(next);
     setSelectedIndex(null);
-    addLog(`🗑️ Delete [${idx}] "${removed}"  ·  O(n)`, "success");
+    addLog(
+      `🗑️ Delete [${idx}] "${removed}"  ·  Shifted ${items.length - idx - 1} left  ·  O(n)`,
+      "success",
+    );
   };
   const handleUpdate = () => {
     if (selectedIndex === null)
       return addLog("⚠️ Select an item first!", "error");
+    const old = items[selectedIndex];
     const next = [...items];
     next[selectedIndex] = inputs.updateProduct;
     setItems(next);
     addLog(
-      `✏️ Update [${selectedIndex}] "${items[selectedIndex]}" → "${inputs.updateProduct}"  ·  O(1)`,
+      `✏️ Update [${selectedIndex}] "${old}" → "${inputs.updateProduct}"  ·  O(1)`,
       "success",
     );
   };
@@ -1058,6 +953,42 @@ export default function GroceryShelf() {
     setSelectedIndex(null);
     setLog([]);
   };
+
+  // ── Enter AR ──
+  // Mirrors the Immersive Web sample's onRequestSession + onSessionStarted
+  const handleEnterAR = async () => {
+    setArError(null);
+    setArStarting(true);
+    setPlacedMatrix(null);
+    setHitMatrix(null);
+
+    // Wire callbacks
+    xrManager.onHit = (matrix) => setHitMatrix(matrix ? matrix.clone() : null);
+
+    // One-time placement — same as sample's addARObjectAt called from onSelect
+    xrManager.onSelect = (matrix) => {
+      setPlacedMatrix(matrix.clone());
+      xrManager.onSelect = null; // only place once
+    };
+
+    xrManager.onEnd = () => {
+      setIsAR(false);
+      setPlacedMatrix(null);
+      setHitMatrix(null);
+      setArStarting(false);
+    };
+
+    try {
+      await xrManager.start(glRef.current);
+      setIsAR(true);
+    } catch (err) {
+      setArError(err.message);
+    } finally {
+      setArStarting(false);
+    }
+  };
+
+  const handleExitAR = () => xrManager.end(); // onEnd handles state reset
 
   const tabBtn = (tab, emoji, label) => (
     <button
@@ -1078,27 +1009,28 @@ export default function GroceryShelf() {
       className="flex flex-col gap-4 w-full"
       style={{ fontFamily: "'Courier New', monospace" }}
     >
-      <AROverlay
-        isAR={isAR}
-        reticleVisible={reticleVisible}
-        placed={!!placedMatrix}
-        onPlace={handlePlace}
-        onExit={handleExitAR}
-        items={items}
-        selectedIndex={selectedIndex}
-        activeTab={activeTab}
-        inputs={inputs}
-        log={log}
-        onAccess={handleAccess}
-        onInsert={handleInsert}
-        onDelete={handleDelete}
-        onUpdate={handleUpdate}
-        onReset={handleReset}
-        setInput={setInput}
-        setActiveTab={setActiveTab}
-        arError={arError}
-      />
+      {/* AR overlay — mounted always so dom-overlay ref exists when session starts */}
+      {isAR && (
+        <AROverlay
+          placedMatrix={placedMatrix}
+          hasHit={!!hitMatrix}
+          items={items}
+          selectedIndex={selectedIndex}
+          activeTab={activeTab}
+          inputs={inputs}
+          log={log}
+          onAccess={handleAccess}
+          onInsert={handleInsert}
+          onDelete={handleDelete}
+          onUpdate={handleUpdate}
+          onReset={handleReset}
+          setInput={setInput}
+          setActiveTab={setActiveTab}
+          onExit={handleExitAR}
+        />
+      )}
 
+      {/* Header */}
       <div className="text-center">
         <h2 className="text-3xl font-bold text-amber-300 tracking-widest">
           🛒 GROCERY SHELF
@@ -1117,73 +1049,108 @@ export default function GroceryShelf() {
         </p>
       </div>
 
-      {arSupported === false && (
-        <div className="flex items-center gap-3 px-4 py-3 bg-red-900/20 border border-red-500/30 rounded-xl text-sm">
-          <span className="text-xl">📵</span>
+      {/* AR error */}
+      {arError && (
+        <div
+          style={{
+            background: "rgba(180,30,30,0.15)",
+            border: "1px solid rgba(200,50,50,0.35)",
+            borderRadius: 12,
+            padding: "12px 16px",
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+          }}
+        >
+          <span style={{ fontSize: 20, flexShrink: 0 }}>⚠️</span>
           <div>
-            <div className="text-red-400 font-bold">AR Not Supported</div>
-            <div className="text-white/40 text-xs">
-              Android Chrome 81+ required. iOS Safari blocks WebXR AR.
+            <div
+              style={{
+                color: "#ff8080",
+                fontWeight: "bold",
+                fontSize: 13,
+                marginBottom: 4,
+              }}
+            >
+              AR could not start
+            </div>
+            <div style={{ color: "rgba(255,255,255,0.65)", fontSize: 12 }}>
+              {arError}
+            </div>
+            <div
+              style={{
+                color: "rgba(255,255,255,0.35)",
+                fontSize: 11,
+                marginTop: 6,
+              }}
+            >
+              Requires Android Chrome 81+ over HTTPS · iOS Safari not yet
+              supported by WebXR
             </div>
           </div>
         </div>
       )}
 
-      {!isAR && arSupported && (
+      {/* Enter AR button */}
+      {!isAR && (
         <div className="flex justify-end">
           <button
             onClick={handleEnterAR}
+            disabled={arStarting}
             style={{
               padding: "10px 22px",
               borderRadius: 10,
               border: "none",
-              background: "linear-gradient(135deg,#f39c12,#e67e22)",
-              color: "#1a1a1a",
+              background: arStarting
+                ? "rgba(255,255,255,0.1)"
+                : "linear-gradient(135deg,#f39c12,#e67e22)",
+              color: arStarting ? "rgba(255,255,255,0.4)" : "#fff",
               fontWeight: "bold",
               fontSize: 14,
-              cursor: "pointer",
-              boxShadow: "0 0 20px rgba(243,156,18,0.4)",
-              fontFamily: "'Courier New', monospace",
+              cursor: arStarting ? "not-allowed" : "pointer",
+              boxShadow: arStarting ? "none" : "0 0 20px rgba(243,156,18,0.35)",
+              fontFamily: "monospace",
             }}
           >
-            📱 Enter AR Mode
+            {arStarting ? "⏳ Requesting camera..." : "📱 Enter AR Mode"}
           </button>
         </div>
       )}
 
-      {/* Canvas always mounted — WebXR takes it over when session starts */}
+      {/* 3D Canvas — stays mounted always; WebXR reuses its gl context */}
       <div
         className="w-full rounded-2xl overflow-hidden border-2 border-amber-400/30 shadow-[0_0_40px_rgba(251,191,36,0.12)]"
         style={{
           height: 420,
           background:
             "linear-gradient(180deg,#0d1b2a 0%,#1a2f4e 60%,#0a1628 100%)",
-          // Keep visible always — WebXR uses this canvas when AR is active
+          display: isAR ? "none" : "block",
         }}
       >
         <Canvas
           camera={{ position: [0, 1.5, 7.5], fov: 42 }}
           shadows
-          gl={{ alpha: true, antialias: true }} // alpha:true needed for transparent AR bg
+          gl={{ alpha: true, antialias: true, xrCompatible: true }}
+          onCreated={({ gl }) => {
+            // Save gl reference so AR session can call makeXRCompatible on it
+            glRef.current = gl;
+          }}
         >
           <ShelfScene
             items={items}
             selectedIndex={selectedIndex}
             onSelect={handleSelect}
             isAR={isAR}
-            startAR={startAR}
             placedMatrix={placedMatrix}
-            reticleRef={reticleRef}
-            onSessionReady={handleSessionReady}
-            onSessionEnd={handleSessionEnd}
-            onHitResult={handleHitResult}
-            onNoHit={handleNoHit}
+            hitMatrix={hitMatrix}
           />
         </Canvas>
       </div>
 
+      {/* Normal 3D mode UI */}
       {!isAR && (
         <>
+          {/* Index row */}
           <div className="flex gap-1 flex-wrap justify-center">
             {items.map((item, i) => (
               <button
@@ -1205,6 +1172,7 @@ export default function GroceryShelf() {
             ))}
           </div>
 
+          {/* Bottom panels */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
               <div className="flex gap-2 mb-4 flex-wrap">
@@ -1241,7 +1209,7 @@ export default function GroceryShelf() {
               {activeTab === "insert" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Insert at index —{" "}
+                    Insert at index, shifts right —{" "}
                     <span className="text-red-400 font-bold">O(n)</span>
                   </p>
                   <div className="flex gap-2 items-center flex-wrap">
@@ -1279,7 +1247,7 @@ export default function GroceryShelf() {
               {activeTab === "delete" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Remove at index —{" "}
+                    Remove at index, shifts left —{" "}
                     <span className="text-red-400 font-bold">O(n)</span>
                   </p>
                   <div className="flex gap-2 items-center">
@@ -1352,20 +1320,20 @@ export default function GroceryShelf() {
                       No operations yet...
                     </p>
                   ) : (
-                    log.map((e, i) => (
+                    log.map((entry, i) => (
                       <div
-                        key={e.id}
+                        key={entry.id}
                         className={`text-xs font-mono py-1 px-2 rounded border-l-2 ${
-                          e.type === "success"
+                          entry.type === "success"
                             ? "border-green-400 bg-green-400/5 text-green-300"
-                            : e.type === "error"
+                            : entry.type === "error"
                               ? "border-red-400 bg-red-400/5 text-red-300"
-                              : e.type === "select"
+                              : entry.type === "select"
                                 ? "border-amber-400 bg-amber-400/5 text-amber-300"
                                 : "border-blue-400 bg-blue-400/5 text-blue-300"
                         } ${i > 0 ? "opacity-50" : ""}`}
                       >
-                        {e.msg}
+                        {entry.msg}
                       </div>
                     ))
                   )}
@@ -1398,6 +1366,7 @@ export default function GroceryShelf() {
               </div>
             </div>
           </div>
+
           <p className="text-center text-white/25 text-xs pb-2">
             💡 Click boxes to select · Drag to rotate · Scroll to zoom
           </p>
