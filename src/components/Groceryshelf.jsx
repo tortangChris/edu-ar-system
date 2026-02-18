@@ -1,25 +1,26 @@
 import { useRef, useState, useEffect, useCallback } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import {
   Text,
   RoundedBox,
   OrbitControls,
   Environment,
 } from "@react-three/drei";
-import { XR, createXRStore, useXRHitTest } from "@react-three/xr";
+import { XR, createXRStore } from "@react-three/xr";
 import { gsap } from "gsap";
 import * as THREE from "three";
 
-// ─── XR Store (singleton) ─────────────────────────────────────────────────────
-const xrStore = createXRStore({
-  features: ["hit-test"],
-  domOverlay:
-    typeof document !== "undefined"
-      ? { root: document.getElementById("ar-hud-root") ?? document.body }
-      : undefined,
-});
+// ─── XR Store ─────────────────────────────────────────────────────────────────
+const xrStore = createXRStore();
 
-// ─── Color palette per product type ──────────────────────────────────────────
+// ─── Placement state machine ──────────────────────────────────────────────────
+const PS = {
+  SCANNING: "scanning",
+  PREVIEWING: "previewing",
+  CONFIRMED: "confirmed",
+};
+
+// ─── Colors / data ────────────────────────────────────────────────────────────
 const PRODUCT_COLORS = {
   apple: { box: "#e74c3c", label: "#c0392b", text: "#fff" },
   milk: { box: "#ecf0f1", label: "#bdc3c7", text: "#2c3e50" },
@@ -29,7 +30,6 @@ const PRODUCT_COLORS = {
   cereal: { box: "#27ae60", label: "#1e8449", text: "#fff" },
   empty: { box: "#1e2a35", label: "#0f1923", text: "#7f8c8d" },
 };
-
 const PRODUCT_EMOJIS = {
   apple: "🍎",
   milk: "🥛",
@@ -39,7 +39,6 @@ const PRODUCT_EMOJIS = {
   cereal: "🌾",
   empty: "—",
 };
-
 const PRODUCTS = ["apple", "milk", "bread", "juice", "coffee", "cereal"];
 const INITIAL_ITEMS = [
   "apple",
@@ -54,87 +53,179 @@ const INITIAL_ITEMS = [
   "bread",
 ];
 
-// ─── AR placement states ──────────────────────────────────────────────────────
-// "scanning"  – reticle visible, no shelf yet
-// "previewing"– user tapped Place, shelf preview shown, confirm buttons visible
-// "confirmed" – shelf locked in, reticle gone
-const PLACE_STATE = {
-  SCANNING: "scanning",
-  PREVIEWING: "previewing",
-  CONFIRMED: "confirmed",
-};
+// ─── Raw WebXR Hit-Test (mirrors the Immersive Web reference exactly) ─────────
+//
+//  1. requestReferenceSpace('viewer')  → ray from camera center
+//  2. requestHitTestSource({ space: viewerSpace })
+//  3. every frame: frame.getHitTestResults(source)[0].getPose(localRefSpace)
+//
+function useRawHitTest({ enabled, onHitPose, onNoHit }) {
+  const { gl } = useThree();
+  const hitTestSourceRef = useRef(null);
+  const localRefSpaceRef = useRef(null);
+  const mountedRef = useRef(true);
 
-// ─── AR Reticle — uses useXRHitTest from @react-three/xr ─────────────────────
-function ARReticle({ onHitPose }) {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    const session = gl.xr?.getSession?.();
+    if (!session) return;
+
+    let cancelled = false;
+
+    // Step 1 + 2 from reference
+    session
+      .requestReferenceSpace("local")
+      .then((localSpace) => {
+        if (cancelled) return;
+        localRefSpaceRef.current = localSpace;
+
+        session
+          .requestReferenceSpace("viewer")
+          .then((viewerSpace) => {
+            if (cancelled) return;
+
+            session
+              .requestHitTestSource({ space: viewerSpace })
+              .then((source) => {
+                if (cancelled) {
+                  source.cancel();
+                  return;
+                }
+                hitTestSourceRef.current = source;
+              })
+              .catch(console.warn);
+          })
+          .catch(console.warn);
+      })
+      .catch(console.warn);
+
+    return () => {
+      cancelled = true;
+      if (hitTestSourceRef.current) {
+        try {
+          hitTestSourceRef.current.cancel();
+        } catch (_) {}
+        hitTestSourceRef.current = null;
+      }
+      localRefSpaceRef.current = null;
+    };
+  }, [enabled, gl]);
+
+  // Step 3 from reference — runs every XR frame
+  useFrame((_, __, frame) => {
+    if (!enabled || !frame) return;
+    const source = hitTestSourceRef.current;
+    const refSpace = localRefSpaceRef.current;
+    if (!source || !refSpace) return;
+
+    const results = frame.getHitTestResults(source);
+    if (results.length > 0) {
+      const pose = results[0].getPose(refSpace);
+      if (pose) {
+        onHitPose(pose.transform.matrix);
+        return;
+      }
+    }
+    onNoHit();
+  });
+}
+
+// ─── AR Reticle ───────────────────────────────────────────────────────────────
+function ARReticle({ onHitPos, onNoHit }) {
   const reticleRef = useRef();
-  // pulseRef for animating the outer pulse ring
   const pulseRef = useRef();
+  const mat4 = useRef(new THREE.Matrix4());
 
-  // useXRHitTest fires the callback every frame with current hit results
-  useXRHitTest((hitMatrix) => {
-    if (!reticleRef.current) return;
-
-    // hitMatrix is a THREE.Matrix4 already in world space
-    reticleRef.current.visible = true;
-    reticleRef.current.matrix.copy(hitMatrix);
-    reticleRef.current.matrix.decompose(
-      reticleRef.current.position,
-      reticleRef.current.quaternion,
-      reticleRef.current.scale,
-    );
-
-    // Report the hit position upward so the parent can use it
-    onHitPose(reticleRef.current.position.clone());
+  useRawHitTest({
+    enabled: true,
+    onHitPose: (matrix) => {
+      if (!reticleRef.current) return;
+      reticleRef.current.visible = true;
+      mat4.current.fromArray(matrix);
+      // decompose so position/quaternion/scale are set from the hit matrix
+      mat4.current.decompose(
+        reticleRef.current.position,
+        reticleRef.current.quaternion,
+        reticleRef.current.scale,
+      );
+      onHitPos(reticleRef.current.position.clone());
+    },
+    onNoHit: () => {
+      if (reticleRef.current) reticleRef.current.visible = false;
+      onNoHit();
+    },
   });
 
-  // Pulse animation on the outer ring
+  // Pulse animation
   useFrame(({ clock }) => {
     if (!pulseRef.current) return;
-    const s = 1 + 0.15 * Math.sin(clock.elapsedTime * 3);
+    const t = clock.elapsedTime;
+    const s = 1 + 0.18 * Math.sin(t * 3.5);
     pulseRef.current.scale.set(s, s, 1);
-    pulseRef.current.material.opacity =
-      0.25 + 0.15 * Math.sin(clock.elapsedTime * 3);
+    pulseRef.current.material.opacity = 0.2 + 0.12 * Math.sin(t * 3.5);
   });
 
   return (
-    <group ref={reticleRef} visible={false} matrixAutoUpdate={false}>
+    <group ref={reticleRef} visible={false}>
       {/* Outer ring */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[0.12, 0.16, 32]} />
+        <ringGeometry args={[0.1, 0.14, 36]} />
         <meshBasicMaterial
           color="#f39c12"
           transparent
-          opacity={0.9}
+          opacity={0.95}
           side={THREE.DoubleSide}
+          depthWrite={false}
         />
       </mesh>
-
       {/* Inner dot */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[0.04, 16]} />
+        <circleGeometry args={[0.04, 20]} />
         <meshBasicMaterial
           color="#ffffff"
           transparent
           opacity={0.85}
           side={THREE.DoubleSide}
+          depthWrite={false}
         />
       </mesh>
-
       {/* Pulse ring */}
       <mesh ref={pulseRef} rotation={[-Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[0.17, 0.2, 32]} />
+        <ringGeometry args={[0.16, 0.19, 36]} />
         <meshBasicMaterial
           color="#f39c12"
           transparent
-          opacity={0.3}
+          opacity={0.25}
           side={THREE.DoubleSide}
+          depthWrite={false}
         />
       </mesh>
     </group>
   );
 }
 
-// ─── Hook: detect WebXR AR support ───────────────────────────────────────────
+// ─── `select` tap listener (screen tap in AR = XRInputSource select event) ────
+function ARTapListener({ active, onTap }) {
+  const { gl } = useThree();
+  useEffect(() => {
+    if (!active) return;
+    const session = gl.xr?.getSession?.();
+    if (!session) return;
+    session.addEventListener("select", onTap);
+    return () => session.removeEventListener("select", onTap);
+  }, [active, gl, onTap]);
+  return null;
+}
+
+// ─── useARSupport ─────────────────────────────────────────────────────────────
 function useARSupport() {
   const [supported, setSupported] = useState(null);
   useEffect(() => {
@@ -150,7 +241,7 @@ function useARSupport() {
   return supported;
 }
 
-// ─── Single Grocery Box ───────────────────────────────────────────────────────
+// ─── GroceryBox ───────────────────────────────────────────────────────────────
 function GroceryBox({ position, index, product, isSelected, onClick }) {
   const groupRef = useRef();
   const boxRef = useRef();
@@ -173,15 +264,9 @@ function GroceryBox({ position, index, product, isSelected, onClick }) {
 
   useFrame(({ clock }) => {
     if (!boxRef.current) return;
-    if (isSelected) {
-      boxRef.current.rotation.y = Math.sin(clock.elapsedTime * 2) * 0.15;
-    } else {
-      boxRef.current.rotation.y = THREE.MathUtils.lerp(
-        boxRef.current.rotation.y,
-        0,
-        0.1,
-      );
-    }
+    boxRef.current.rotation.y = isSelected
+      ? Math.sin(clock.elapsedTime * 2) * 0.15
+      : THREE.MathUtils.lerp(boxRef.current.rotation.y, 0, 0.1);
   });
 
   return (
@@ -239,7 +324,6 @@ function GroceryBox({ position, index, product, isSelected, onClick }) {
           </mesh>
         )}
       </group>
-      {/* Index label */}
       <group position={[0, -0.65, 0]}>
         <RoundedBox args={[0.44, 0.22, 0.08]} radius={0.04} smoothness={4}>
           <meshStandardMaterial
@@ -303,34 +387,35 @@ function ShelfFrame({ height, width }) {
   );
 }
 
-// ─── Full 3D Shelf Scene ──────────────────────────────────────────────────────
+// ─── ShelfScene ───────────────────────────────────────────────────────────────
 function ShelfScene({
   items,
   selectedIndex,
   onSelect,
   isAR,
   placeState,
-  anchorPosition,
-  onHitPose,
+  anchorPos,
+  onHitPos,
+  onNoHit,
+  onTap,
 }) {
   const ITEM_W = 0.95;
   const ROW = Math.ceil(items.length / 2);
   const SHELF_Y = [-0.3, 1.15];
   const row0 = items.slice(0, ROW);
   const row1 = items.slice(ROW);
-
   const AR_SCALE = 0.28;
 
-  // Ghost/preview shelf fades in while previewing
-  const previewOpacity = placeState === PLACE_STATE.PREVIEWING ? 0.6 : 1.0;
-
-  const groupProps =
-    isAR && anchorPosition
+  const shelfProps =
+    isAR && anchorPos
       ? {
-          position: [anchorPosition.x, anchorPosition.y, anchorPosition.z],
+          position: [anchorPos.x, anchorPos.y, anchorPos.z],
           scale: [AR_SCALE, AR_SCALE, AR_SCALE],
         }
       : { position: [0, -0.6, 0], scale: [1, 1, 1] };
+
+  const showShelf =
+    !isAR || placeState === PS.PREVIEWING || placeState === PS.CONFIRMED;
 
   const renderRow = (row, startIdx, shelfY) =>
     row.map((product, i) => (
@@ -343,12 +428,6 @@ function ShelfScene({
         onClick={onSelect}
       />
     ));
-
-  // Whether to show the shelf mesh
-  const showShelf =
-    !isAR ||
-    placeState === PLACE_STATE.PREVIEWING ||
-    placeState === PLACE_STATE.CONFIRMED;
 
   return (
     <>
@@ -366,21 +445,23 @@ function ShelfScene({
       <pointLight position={[0, 3, 2]} intensity={0.5} color="#fff5e0" />
 
       {/* Reticle — only while scanning */}
-      {isAR && placeState === PLACE_STATE.SCANNING && (
-        <ARReticle onHitPose={onHitPose} />
+      {isAR && placeState === PS.SCANNING && (
+        <ARReticle onHitPos={onHitPos} onNoHit={onNoHit} />
+      )}
+
+      {/* Tap listener — active only while scanning */}
+      {isAR && (
+        <ARTapListener active={placeState === PS.SCANNING} onTap={onTap} />
       )}
 
       {/* Shelf */}
       {showShelf && (
-        <group {...groupProps}>
-          {/* Dim preview shelf so user knows it's not locked yet */}
-          <group>
-            <ShelfFrame height={2.4} width={ROW * ITEM_W} />
-            <ShelfBoard y={SHELF_Y[0]} width={ROW * ITEM_W} />
-            <ShelfBoard y={SHELF_Y[1]} width={ROW * ITEM_W} />
-            {renderRow(row0, 0, SHELF_Y[0])}
-            {renderRow(row1, ROW, SHELF_Y[1])}
-          </group>
+        <group {...shelfProps}>
+          <ShelfFrame height={2.4} width={ROW * ITEM_W} />
+          <ShelfBoard y={SHELF_Y[0]} width={ROW * ITEM_W} />
+          <ShelfBoard y={SHELF_Y[1]} width={ROW * ITEM_W} />
+          {renderRow(row0, 0, SHELF_Y[0])}
+          {renderRow(row1, ROW, SHELF_Y[1])}
         </group>
       )}
 
@@ -401,12 +482,11 @@ function ShelfScene({
   );
 }
 
-// ─── AR HUD Overlay ───────────────────────────────────────────────────────────
+// ─── AR HUD ───────────────────────────────────────────────────────────────────
 function ARHud({
   isAR,
   placeState,
-  hasHitSurface, // true when reticle is tracking a surface
-  onPlace,
+  hasHit,
   onConfirm,
   onReplace,
   onExit,
@@ -427,17 +507,16 @@ function ARHud({
 
   return (
     <div
-      id="ar-hud-root"
       style={{
         position: "fixed",
         inset: 0,
         zIndex: 9999,
         pointerEvents: "none",
-        fontFamily: "'Courier New', monospace",
+        fontFamily: "'Courier New',monospace",
       }}
     >
-      {/* ── SCANNING: point & tap to place ── */}
-      {placeState === PLACE_STATE.SCANNING && (
+      {/* SCANNING */}
+      {placeState === PS.SCANNING && (
         <div
           style={{
             position: "absolute",
@@ -448,7 +527,7 @@ function ARHud({
             flexDirection: "column",
             alignItems: "center",
             gap: 12,
-            pointerEvents: "auto",
+            pointerEvents: "none",
           }}
         >
           <div
@@ -472,33 +551,16 @@ function ARHud({
                 marginTop: 4,
               }}
             >
-              Move your phone slowly until the ring appears
+              {hasHit
+                ? "✨ Surface found — tap the screen to place!"
+                : "Move your phone slowly until the ring appears"}
             </div>
           </div>
-
-          {hasHitSurface && (
-            <button
-              onClick={onPlace}
-              style={{
-                background: "#f39c12",
-                border: "none",
-                borderRadius: 50,
-                padding: "14px 36px",
-                color: "#1a1a1a",
-                fontWeight: "bold",
-                fontSize: 16,
-                cursor: "pointer",
-                boxShadow: "0 0 24px rgba(243,156,18,0.6)",
-              }}
-            >
-              📦 Place Shelf Here
-            </button>
-          )}
         </div>
       )}
 
-      {/* ── PREVIEWING: confirm or re-place ── */}
-      {placeState === PLACE_STATE.PREVIEWING && (
+      {/* PREVIEWING */}
+      {placeState === PS.PREVIEWING && (
         <div
           style={{
             position: "absolute",
@@ -508,7 +570,7 @@ function ARHud({
             display: "flex",
             flexDirection: "column",
             alignItems: "center",
-            gap: 12,
+            gap: 14,
             pointerEvents: "auto",
           }}
         >
@@ -525,7 +587,7 @@ function ARHud({
               style={{
                 color: "#f39c12",
                 fontWeight: "bold",
-                fontSize: 14,
+                fontSize: 15,
                 marginBottom: 4,
               }}
             >
@@ -535,7 +597,6 @@ function ARHud({
               Happy with the position? Confirm to lock it in.
             </div>
           </div>
-
           <div style={{ display: "flex", gap: 12 }}>
             <button
               onClick={onReplace}
@@ -543,7 +604,7 @@ function ARHud({
                 padding: "12px 24px",
                 borderRadius: 12,
                 border: "2px solid rgba(255,255,255,0.25)",
-                background: "rgba(0,0,0,0.7)",
+                background: "rgba(0,0,0,0.75)",
                 color: "#fff",
                 fontWeight: "bold",
                 fontSize: 14,
@@ -566,16 +627,15 @@ function ARHud({
                 boxShadow: "0 0 20px rgba(243,156,18,0.5)",
               }}
             >
-              ✅ Confirm Placement
+              ✅ Confirm
             </button>
           </div>
         </div>
       )}
 
-      {/* ── CONFIRMED: full operation HUD ── */}
-      {placeState === PLACE_STATE.CONFIRMED && (
+      {/* CONFIRMED */}
+      {placeState === PS.CONFIRMED && (
         <>
-          {/* Top info bar */}
           <div
             style={{
               position: "absolute",
@@ -605,7 +665,6 @@ function ARHud({
             </span>
           </div>
 
-          {/* Tab buttons */}
           <div
             style={{
               position: "absolute",
@@ -646,7 +705,6 @@ function ARHud({
             ))}
           </div>
 
-          {/* Operation panel */}
           <div
             style={{
               position: "absolute",
@@ -662,23 +720,20 @@ function ARHud({
           >
             {activeTab === "access" && (
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
-                  Index
-                </span>
+                <span style={labelS}>Index</span>
                 <input
                   type="number"
                   min={0}
                   max={items.length - 1}
                   value={inputs.accessIdx}
                   onChange={(e) => setInput("accessIdx", e.target.value)}
-                  style={inputStyle}
+                  style={inpS}
                 />
                 <button
                   onClick={onAccess}
-                  style={{ ...btnStyle, background: "#2980b9" }}
+                  style={{ ...btnS, background: "#2980b9" }}
                 >
-                  Access{" "}
-                  <span style={{ color: "#7fe0a0", fontSize: 11 }}>O(1)</span>
+                  Access <small style={{ color: "#7fe0a0" }}>O(1)</small>
                 </button>
               </div>
             )}
@@ -691,21 +746,19 @@ function ARHud({
                   flexWrap: "wrap",
                 }}
               >
-                <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
-                  Index
-                </span>
+                <span style={labelS}>Index</span>
                 <input
                   type="number"
                   min={0}
                   max={items.length}
                   value={inputs.insertIdx}
                   onChange={(e) => setInput("insertIdx", e.target.value)}
-                  style={inputStyle}
+                  style={inpS}
                 />
                 <select
                   value={inputs.insertProduct}
                   onChange={(e) => setInput("insertProduct", e.target.value)}
-                  style={selectStyle}
+                  style={selS}
                 >
                   {PRODUCTS.map((p) => (
                     <option key={p} value={p}>
@@ -715,32 +768,28 @@ function ARHud({
                 </select>
                 <button
                   onClick={onInsert}
-                  style={{ ...btnStyle, background: "#27ae60" }}
+                  style={{ ...btnS, background: "#27ae60" }}
                 >
-                  Insert{" "}
-                  <span style={{ color: "#ff9e9e", fontSize: 11 }}>O(n)</span>
+                  Insert <small style={{ color: "#ff9e9e" }}>O(n)</small>
                 </button>
               </div>
             )}
             {activeTab === "delete" && (
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
-                  Index
-                </span>
+                <span style={labelS}>Index</span>
                 <input
                   type="number"
                   min={0}
                   max={items.length - 1}
                   value={inputs.deleteIdx}
                   onChange={(e) => setInput("deleteIdx", e.target.value)}
-                  style={inputStyle}
+                  style={inpS}
                 />
                 <button
                   onClick={onDelete}
-                  style={{ ...btnStyle, background: "#c0392b" }}
+                  style={{ ...btnS, background: "#c0392b" }}
                 >
-                  Delete{" "}
-                  <span style={{ color: "#ff9e9e", fontSize: 11 }}>O(n)</span>
+                  Delete <small style={{ color: "#ff9e9e" }}>O(n)</small>
                 </button>
               </div>
             )}
@@ -753,13 +802,11 @@ function ARHud({
                   flexWrap: "wrap",
                 }}
               >
-                <span style={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
-                  Replace with
-                </span>
+                <span style={labelS}>Replace with</span>
                 <select
                   value={inputs.updateProduct}
                   onChange={(e) => setInput("updateProduct", e.target.value)}
-                  style={selectStyle}
+                  style={selS}
                 >
                   {PRODUCTS.map((p) => (
                     <option key={p} value={p}>
@@ -771,23 +818,21 @@ function ARHud({
                   onClick={onUpdate}
                   disabled={selectedIndex === null}
                   style={{
-                    ...btnStyle,
+                    ...btnS,
                     background: selectedIndex === null ? "#555" : "#8e44ad",
                     cursor: selectedIndex === null ? "not-allowed" : "pointer",
                   }}
                 >
                   Update [{selectedIndex ?? "?"}]{" "}
-                  <span style={{ color: "#7fe0a0", fontSize: 11 }}>O(1)</span>
+                  <small style={{ color: "#7fe0a0" }}>O(1)</small>
                 </button>
               </div>
             )}
-
             {log.length > 0 && (
               <div
                 style={{
                   marginTop: 10,
                   fontSize: 11,
-                  fontFamily: "monospace",
                   color:
                     log[0].type === "success"
                       ? "#7fe0a0"
@@ -803,7 +848,6 @@ function ARHud({
             )}
           </div>
 
-          {/* Bottom controls */}
           <div
             style={{
               position: "absolute",
@@ -812,27 +856,18 @@ function ARHud({
               right: 16,
               display: "flex",
               gap: 8,
-              justifyContent: "space-between",
               pointerEvents: "auto",
             }}
           >
             <button
               onClick={onReset}
-              style={{
-                ...btnStyle,
-                background: "rgba(255,255,255,0.1)",
-                flex: 1,
-              }}
+              style={{ ...btnS, background: "rgba(255,255,255,0.1)", flex: 1 }}
             >
               🔄 Reset
             </button>
             <button
               onClick={onExit}
-              style={{
-                ...btnStyle,
-                background: "rgba(180,30,30,0.7)",
-                flex: 1,
-              }}
+              style={{ ...btnS, background: "rgba(180,30,30,0.7)", flex: 1 }}
             >
               ✕ Exit AR
             </button>
@@ -843,7 +878,8 @@ function ARHud({
   );
 }
 
-const inputStyle = {
+const labelS = { color: "rgba(255,255,255,0.6)", fontSize: 13 };
+const inpS = {
   width: 60,
   padding: "6px 10px",
   background: "rgba(0,0,0,0.5)",
@@ -853,7 +889,7 @@ const inputStyle = {
   fontFamily: "monospace",
   fontSize: 13,
 };
-const btnStyle = {
+const btnS = {
   padding: "8px 14px",
   borderRadius: 8,
   border: "none",
@@ -862,7 +898,7 @@ const btnStyle = {
   fontSize: 13,
   cursor: "pointer",
 };
-const selectStyle = {
+const selS = {
   padding: "6px 10px",
   background: "rgba(0,0,0,0.5)",
   border: "1px solid rgba(255,255,255,0.2)",
@@ -871,7 +907,6 @@ const selectStyle = {
   fontSize: 13,
 };
 
-// ─── AR Not Supported Banner ──────────────────────────────────────────────────
 function ARUnsupportedBanner() {
   return (
     <div
@@ -893,52 +928,12 @@ function ARUnsupportedBanner() {
         </div>
         <div style={{ color: "rgba(255,255,255,0.5)", fontSize: 11 }}>
           Use Android Chrome 81+ or a WebXR-compatible browser. iOS Safari not
-          yet supported.
+          supported.
         </div>
       </div>
     </div>
   );
 }
-
-// ─── AR Enter Button ──────────────────────────────────────────────────────────
-function ARButton({ supported, onEnter }) {
-  if (supported === null)
-    return (
-      <button
-        disabled
-        style={{
-          ...arBtnBase,
-          background: "rgba(255,255,255,0.1)",
-          color: "rgba(255,255,255,0.4)",
-        }}
-      >
-        Checking AR support…
-      </button>
-    );
-  if (!supported) return null;
-  return (
-    <button
-      onClick={onEnter}
-      style={{
-        ...arBtnBase,
-        background: "linear-gradient(135deg,#f39c12,#e67e22)",
-        boxShadow: "0 0 20px rgba(243,156,18,0.4)",
-      }}
-    >
-      📱 Enter AR Mode
-    </button>
-  );
-}
-const arBtnBase = {
-  padding: "10px 22px",
-  borderRadius: 10,
-  border: "none",
-  color: "#fff",
-  fontWeight: "bold",
-  fontSize: 14,
-  cursor: "pointer",
-  fontFamily: "'Courier New', monospace",
-};
 
 // ─── Main Export ──────────────────────────────────────────────────────────────
 export default function GroceryShelf() {
@@ -954,31 +949,28 @@ export default function GroceryShelf() {
     updateProduct: "juice",
   });
 
-  // AR state machine
   const [isAR, setIsAR] = useState(false);
-  const [placeState, setPlaceState] = useState(PLACE_STATE.SCANNING);
-  const [anchorPosition, setAnchorPos] = useState(null); // locked world pos
-  const [hitPosition, setHitPosition] = useState(null); // live reticle pos
+  const [placeState, setPlaceState] = useState(PS.SCANNING);
+  const [anchorPos, setAnchorPos] = useState(null); // THREE.Vector3, locked
+  const [hitPos, setHitPos] = useState(null); // THREE.Vector3, live reticle
   const arSupported = useARSupport();
 
   const addLog = (msg, type = "info") =>
-    setLog((prev) => [{ msg, type, id: Date.now() }, ...prev].slice(0, 8));
+    setLog((p) => [{ msg, type, id: Date.now() }, ...p].slice(0, 8));
 
-  const setInput = (key, val) => setInputs((prev) => ({ ...prev, [key]: val }));
+  const setInput = (k, v) => setInputs((p) => ({ ...p, [k]: v }));
 
   const handleSelect = (idx) => {
-    setSelectedIndex((prev) => (prev === idx ? null : idx));
+    setSelectedIndex((p) => (p === idx ? null : idx));
     addLog(`Selected [${idx}] → "${items[idx]}"`, "select");
   };
-
   const handleAccess = () => {
     const idx = +inputs.accessIdx;
     if (idx < 0 || idx >= items.length)
       return addLog("⚠️ Index out of bounds!", "error");
     setSelectedIndex(idx);
-    addLog(`✅ Access [${idx}] → "${items[idx]}"  ·  Time: O(1)`, "success");
+    addLog(`✅ Access [${idx}] → "${items[idx]}"  ·  O(1)`, "success");
   };
-
   const handleInsert = () => {
     const idx = +inputs.insertIdx;
     if (idx < 0 || idx > items.length)
@@ -993,7 +985,6 @@ export default function GroceryShelf() {
       "success",
     );
   };
-
   const handleDelete = () => {
     const idx = +inputs.deleteIdx;
     if (idx < 0 || idx >= items.length)
@@ -1009,7 +1000,6 @@ export default function GroceryShelf() {
       "success",
     );
   };
-
   const handleUpdate = () => {
     if (selectedIndex === null)
       return addLog("⚠️ Select an item first!", "error");
@@ -1022,51 +1012,56 @@ export default function GroceryShelf() {
       "success",
     );
   };
-
   const handleReset = () => {
     setItems([...INITIAL_ITEMS]);
     setSelectedIndex(null);
     setLog([]);
   };
 
-  // ── AR handlers ──
+  // ── AR flow ──
   const handleEnterAR = useCallback(async () => {
-    setPlaceState(PLACE_STATE.SCANNING);
+    setPlaceState(PS.SCANNING);
     setAnchorPos(null);
-    setHitPosition(null);
-    await xrStore.enterAR();
+    setHitPos(null);
+    // Must include hit-test in required features
+    await xrStore.enterAR({ requiredFeatures: ["local", "hit-test"] });
     setIsAR(true);
   }, []);
 
   const handleExitAR = useCallback(() => {
-    xrStore.getState()?.session?.end();
+    try {
+      xrStore.getState()?.session?.end();
+    } catch (_) {}
     setIsAR(false);
-    setPlaceState(PLACE_STATE.SCANNING);
+    setPlaceState(PS.SCANNING);
     setAnchorPos(null);
-    setHitPosition(null);
+    setHitPos(null);
   }, []);
 
-  // Called every frame by ARReticle with the current hit position
-  const handleHitPose = useCallback((pos) => setHitPosition(pos), []);
+  // Every frame callback — updates live hit position
+  const handleHitPos = useCallback((pos) => setHitPos(pos), []);
+  const handleNoHit = useCallback(() => setHitPos(null), []);
 
-  // User taps "Place Shelf Here" → show preview at current hit position
-  const handlePlace = useCallback(() => {
-    if (hitPosition) {
-      setAnchorPos(hitPosition.clone());
-      setPlaceState(PLACE_STATE.PREVIEWING);
-    }
-  }, [hitPosition]);
-
-  // User confirms → lock shelf, hide reticle
-  const handleConfirm = useCallback(() => {
-    setPlaceState(PLACE_STATE.CONFIRMED);
+  // Screen tap while scanning → snapshot the current hitPos as preview anchor
+  const handleTap = useCallback(() => {
+    // Use functional updater to safely read latest hitPos without stale closure
+    setHitPos((current) => {
+      if (current) {
+        setAnchorPos(current.clone());
+        setPlaceState(PS.PREVIEWING);
+      }
+      return current;
+    });
   }, []);
 
-  // User wants to try a different spot → back to scanning
+  // Confirm → lock the shelf
+  const handleConfirm = useCallback(() => setPlaceState(PS.CONFIRMED), []);
+
+  // Re-place → go back to scanning
   const handleReplace = useCallback(() => {
     setAnchorPos(null);
-    setHitPosition(null);
-    setPlaceState(PLACE_STATE.SCANNING);
+    setHitPos(null);
+    setPlaceState(PS.SCANNING);
   }, []);
 
   const tabBtn = (tab, emoji, label) => (
@@ -1086,14 +1081,12 @@ export default function GroceryShelf() {
   return (
     <div
       className="flex flex-col gap-4 w-full"
-      style={{ fontFamily: "'Courier New', monospace" }}
+      style={{ fontFamily: "'Courier New',monospace" }}
     >
-      {/* AR HUD rendered into the DOM overlay */}
       <ARHud
         isAR={isAR}
         placeState={placeState}
-        hasHitSurface={!!hitPosition}
-        onPlace={handlePlace}
+        hasHit={!!hitPos}
         onConfirm={handleConfirm}
         onReplace={handleReplace}
         onExit={handleExitAR}
@@ -1111,7 +1104,6 @@ export default function GroceryShelf() {
         log={log}
       />
 
-      {/* Header */}
       <div className="text-center">
         <h2 className="text-3xl font-bold text-amber-300 tracking-widest">
           🛒 GROCERY SHELF
@@ -1134,11 +1126,29 @@ export default function GroceryShelf() {
 
       {!isAR && (
         <div className="flex justify-end">
-          <ARButton supported={arSupported} onEnter={handleEnterAR} />
+          {arSupported === null && (
+            <button
+              disabled
+              className="px-5 py-2.5 rounded-xl bg-white/10 text-white/40 font-bold text-sm border-none"
+            >
+              Checking AR…
+            </button>
+          )}
+          {arSupported === true && (
+            <button
+              onClick={handleEnterAR}
+              className="px-5 py-2.5 rounded-xl border-none font-bold text-sm text-white cursor-pointer"
+              style={{
+                background: "linear-gradient(135deg,#f39c12,#e67e22)",
+                boxShadow: "0 0 20px rgba(243,156,18,0.4)",
+              }}
+            >
+              📱 Enter AR Mode
+            </button>
+          )}
         </div>
       )}
 
-      {/* 3D Canvas */}
       <div
         className="w-full rounded-2xl overflow-hidden border-2 border-amber-400/30 shadow-[0_0_40px_rgba(251,191,36,0.12)]"
         style={{
@@ -1156,14 +1166,15 @@ export default function GroceryShelf() {
               onSelect={handleSelect}
               isAR={isAR}
               placeState={placeState}
-              anchorPosition={anchorPosition}
-              onHitPose={handleHitPose}
+              anchorPos={anchorPos}
+              onHitPos={handleHitPos}
+              onNoHit={handleNoHit}
+              onTap={handleTap}
             />
           </XR>
         </Canvas>
       </div>
 
-      {/* Normal 3D mode UI */}
       {!isAR && (
         <>
           <div className="flex gap-1 flex-wrap justify-center">
@@ -1188,7 +1199,6 @@ export default function GroceryShelf() {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {/* Operations */}
             <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
               <div className="flex gap-2 mb-4 flex-wrap">
                 {tabBtn("access", "🔍", "Access")}
@@ -1196,7 +1206,6 @@ export default function GroceryShelf() {
                 {tabBtn("delete", "🗑️", "Delete")}
                 {tabBtn("update", "✏️", "Update")}
               </div>
-
               {activeTab === "access" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
@@ -1225,7 +1234,7 @@ export default function GroceryShelf() {
               {activeTab === "insert" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Insert at index, shifts elements right —{" "}
+                    Insert at index, shifts right —{" "}
                     <span className="text-red-400 font-bold">O(n)</span>
                   </p>
                   <div className="flex gap-2 items-center flex-wrap">
@@ -1263,7 +1272,7 @@ export default function GroceryShelf() {
               {activeTab === "delete" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Remove at index, shifts elements left —{" "}
+                    Remove at index, shifts left —{" "}
                     <span className="text-red-400 font-bold">O(n)</span>
                   </p>
                   <div className="flex gap-2 items-center">
@@ -1317,7 +1326,6 @@ export default function GroceryShelf() {
                   </div>
                 </div>
               )}
-
               <button
                 onClick={handleReset}
                 className="mt-4 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-white/50 hover:text-white/80 text-sm transition-all"
@@ -1326,7 +1334,6 @@ export default function GroceryShelf() {
               </button>
             </div>
 
-            {/* Log + Complexity */}
             <div className="bg-black/40 border border-white/10 rounded-2xl p-5 flex flex-col gap-4">
               <div>
                 <p className="text-white/40 text-xs uppercase tracking-widest mb-2">
@@ -1335,23 +1342,23 @@ export default function GroceryShelf() {
                 <div className="flex flex-col gap-1 max-h-36 overflow-y-auto">
                   {log.length === 0 ? (
                     <p className="text-white/30 text-xs italic">
-                      No operations yet...
+                      No operations yet…
                     </p>
                   ) : (
-                    log.map((entry, i) => (
+                    log.map((e, i) => (
                       <div
-                        key={entry.id}
+                        key={e.id}
                         className={`text-xs font-mono py-1 px-2 rounded border-l-2 ${
-                          entry.type === "success"
+                          e.type === "success"
                             ? "border-green-400 bg-green-400/5 text-green-300"
-                            : entry.type === "error"
+                            : e.type === "error"
                               ? "border-red-400 bg-red-400/5 text-red-300"
-                              : entry.type === "select"
+                              : e.type === "select"
                                 ? "border-amber-400 bg-amber-400/5 text-amber-300"
                                 : "border-blue-400 bg-blue-400/5 text-blue-300"
                         } ${i > 0 ? "opacity-50" : ""}`}
                       >
-                        {entry.msg}
+                        {e.msg}
                       </div>
                     ))
                   )}
