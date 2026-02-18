@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import GroceryShelf from "../components/GroceryShelf";
+import GroceryShelf from "../components/Groceryshelf";
 
 const scenarios = [
   {
