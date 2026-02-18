@@ -56,7 +56,7 @@ class XRSessionManager {
     this.onSelect = null;
   }
 
-  async start(gl) {
+  async start(renderer) {
     if (!navigator.xr) throw new Error("WebXR not available on this browser.");
 
     const supported = await navigator.xr.isSessionSupported("immersive-ar");
@@ -78,20 +78,29 @@ class XRSessionManager {
       throw new Error("Camera error: " + err.message);
     }
 
-    // Make existing canvas GL context XR-compatible
-    await gl.getContext().makeXRCompatible?.();
+    // FIX 1: Get the raw WebGL context from the canvas element
+    const canvas = renderer.domElement;
+    const gl =
+      canvas.getContext("webgl2") ||
+      canvas.getContext("webgl") ||
+      canvas.getContext("experimental-webgl");
 
-    // ── CRITICAL FIX ──
-    // The overlay element MUST exist in DOM before requestSession is called.
-    // We always render <div id="ar-overlay"> in the JSX (never conditionally),
-    // so it is guaranteed to be present here.
+    if (!gl) throw new Error("Could not get WebGL context from canvas.");
+
+    // FIX 2: makeXRCompatible on the raw GL context
+    try {
+      await gl.makeXRCompatible();
+    } catch (e) {
+      // Some browsers don't need this or throw — safe to ignore
+      console.warn("makeXRCompatible:", e);
+    }
+
     const overlayRoot = document.getElementById("ar-overlay");
 
     const sessionInit = {
       requiredFeatures: ["local", "hit-test"],
     };
 
-    // Only add domOverlay if the element actually exists (safety check)
     if (overlayRoot) {
       sessionInit.optionalFeatures = ["dom-overlay"];
       sessionInit.domOverlay = { root: overlayRoot };
@@ -102,8 +111,13 @@ class XRSessionManager {
       sessionInit,
     );
 
-    const baseLayer = new XRWebGLLayer(this.session, gl.getContext());
+    // FIX 3: Pass the raw GL context to XRWebGLLayer, not the renderer
+    const baseLayer = new XRWebGLLayer(this.session, gl);
     this.session.updateRenderState({ baseLayer });
+
+    // FIX 4: Tell Three.js renderer to use this XR session
+    renderer.xr.enabled = true;
+    await renderer.xr.setSession(this.session);
 
     this.session.addEventListener("end", () => {
       this.hitTestSource = null;
@@ -112,6 +126,7 @@ class XRSessionManager {
       this.viewerSpace = null;
       this.hitMatrix = null;
       this.isActive = false;
+      renderer.xr.enabled = false;
       this.onEnd?.();
     });
 
@@ -208,18 +223,11 @@ function Reticle({ hitMatrix }) {
 }
 
 // ─── XR Frame Bridge ──────────────────────────────────────────────────────────
+// FIX 5: Removed manual gl.xr.enabled toggle here — now handled in XRSessionManager
 function XRFrameBridge({ isAR }) {
-  const { gl } = useThree();
-
-  useEffect(() => {
-    if (isAR) gl.xr.enabled = true;
-    return () => {
-      gl.xr.enabled = false;
-    };
-  }, [isAR, gl]);
-
   useFrame((state) => {
     if (!isAR || !xrManager.isActive) return;
+    // FIX 6: Use state.gl.xr.getFrame() correctly
     const frame = state.gl.xr.getFrame?.();
     if (frame) xrManager.processFrame(frame);
   });
@@ -483,9 +491,6 @@ function ShelfScene({
 }
 
 // ─── AR Overlay ───────────────────────────────────────────────────────────────
-// ALWAYS rendered in DOM — never conditionally mounted.
-// Visibility is controlled via CSS display/opacity, not React conditional rendering.
-// This guarantees document.getElementById("ar-overlay") never returns null.
 function AROverlay({
   isAR,
   placedMatrix,
@@ -513,11 +518,9 @@ function AROverlay({
         zIndex: 9999,
         pointerEvents: "none",
         fontFamily: "'Courier New', monospace",
-        // Hidden when not in AR — but element always exists in DOM
         display: isAR ? "block" : "none",
       }}
     >
-      {/* Scanning state */}
       {isAR && !placedMatrix && (
         <div
           style={{
@@ -575,10 +578,8 @@ function AROverlay({
         </div>
       )}
 
-      {/* Placed state — full HUD */}
       {isAR && placedMatrix && (
         <>
-          {/* Top bar */}
           <div
             style={{
               position: "absolute",
@@ -606,7 +607,6 @@ function AROverlay({
             </span>
           </div>
 
-          {/* Tab buttons */}
           <div
             style={{
               position: "absolute",
@@ -649,7 +649,6 @@ function AROverlay({
             ))}
           </div>
 
-          {/* Operation panel */}
           <div
             style={{
               position: "absolute",
@@ -797,7 +796,6 @@ function AROverlay({
             )}
           </div>
 
-          {/* Bottom controls */}
           <div
             style={{
               position: "absolute",
@@ -877,7 +875,9 @@ export default function GroceryShelf() {
   const [arError, setArError] = useState(null);
   const [arStarting, setArStarting] = useState(false);
 
-  const glRef = useRef(null);
+  // FIX 7: Store the Three.js WebGLRenderer (not gl context) so XRSessionManager
+  // can access both renderer.domElement (for raw GL context) and renderer.xr
+  const rendererRef = useRef(null);
 
   const addLog = (msg, type = "info") =>
     setLog((prev) => [{ msg, type, id: Date.now() }, ...prev].slice(0, 8));
@@ -949,7 +949,7 @@ export default function GroceryShelf() {
     xrManager.onHit = (matrix) => setHitMatrix(matrix ? matrix.clone() : null);
     xrManager.onSelect = (matrix) => {
       setPlacedMatrix(matrix.clone());
-      xrManager.onSelect = null; // one-time placement
+      xrManager.onSelect = null;
     };
     xrManager.onEnd = () => {
       setIsAR(false);
@@ -959,7 +959,9 @@ export default function GroceryShelf() {
     };
 
     try {
-      await xrManager.start(glRef.current);
+      // FIX 8: Pass the renderer (not glRef) to xrManager.start()
+      if (!rendererRef.current) throw new Error("Renderer not ready yet.");
+      await xrManager.start(rendererRef.current);
       setIsAR(true);
     } catch (err) {
       setArError(err.message);
@@ -989,12 +991,7 @@ export default function GroceryShelf() {
       className="flex flex-col gap-4 w-full"
       style={{ fontFamily: "'Courier New', monospace" }}
     >
-      {/*
-        ── CRITICAL: AROverlay is ALWAYS rendered, never conditionally mounted ──
-        The div#ar-overlay must exist in the DOM before requestSession() is called.
-        We control visibility via the `display: isAR ? "block" : "none"` CSS inside
-        AROverlay, NOT by mounting/unmounting the component.
-      */}
+      {/* AROverlay always in DOM — visibility controlled by CSS inside */}
       <AROverlay
         isAR={isAR}
         placedMatrix={placedMatrix}
@@ -1091,7 +1088,7 @@ export default function GroceryShelf() {
         </div>
       )}
 
-      {/* 3D Canvas — always mounted, WebXR reuses its gl context */}
+      {/* 3D Canvas — always mounted so WebXR can reuse its gl context */}
       <div
         className="w-full rounded-2xl overflow-hidden border-2 border-amber-400/30 shadow-[0_0_40px_rgba(251,191,36,0.12)]"
         style={{
@@ -1106,7 +1103,8 @@ export default function GroceryShelf() {
           shadows
           gl={{ alpha: true, antialias: true, xrCompatible: true }}
           onCreated={({ gl }) => {
-            glRef.current = gl;
+            // FIX 9: Store the Three.js WebGLRenderer (gl IS the renderer in R3F)
+            rendererRef.current = gl;
           }}
         >
           <ShelfScene
