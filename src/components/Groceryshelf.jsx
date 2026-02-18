@@ -64,89 +64,146 @@ function useARSupport() {
   return supported;
 }
 
-// ─── THE CORE: mirrors the Immersive Web reference 1-to-1 ────────────────────
-//
-// Reference pattern:
-//   module-level vars:  xrHitTestSource, xrRefSpace, reticle (mutable object)
-//   onSelect reads:     reticle.matrix  ← always fresh, no closure issue
-//   onXRFrame updates:  reticle.matrix = pose.transform.matrix
-//
-// Our R3F version:
-//   reticleRef        ← the Three.js group (same as reticle object in reference)
-//   hitTestSourceRef  ← xrHitTestSource
-//   localSpaceRef     ← xrRefSpace
-//   session.onselectend ← registered once in useFrame when session first appears
-//
+// ─── Debug log (shows on screen inside AR) ───────────────────────────────────
+const debugLines = [];
+function dbg(msg) {
+  const ts = new Date().toISOString().slice(11, 23);
+  debugLines.unshift(`[${ts}] ${msg}`);
+  if (debugLines.length > 12) debugLines.pop();
+}
+
+function DebugOverlay({ visible }) {
+  const [lines, setLines] = useState([]);
+  useEffect(() => {
+    if (!visible) return;
+    const id = setInterval(() => setLines([...debugLines]), 300);
+    return () => clearInterval(id);
+  }, [visible]);
+  if (!visible) return null;
+  return (
+    <div
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        zIndex: 99999,
+        background: "rgba(0,0,0,0.85)",
+        padding: "8px 12px",
+        fontFamily: "monospace",
+        fontSize: 11,
+        color: "#0f0",
+        pointerEvents: "none",
+        maxHeight: "45vh",
+        overflow: "hidden",
+      }}
+    >
+      {lines.map((l, i) => (
+        <div key={i} style={{ opacity: 1 - i * 0.07 }}>
+          {l}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── AR Core ─────────────────────────────────────────────────────────────────
 function ARCore({ onPlacePreview, onHasHit }) {
   const { gl } = useThree();
 
-  // Mirrors module-level vars in the reference
   const hitTestSourceRef = useRef(null);
   const localSpaceRef = useRef(null);
-  const reticleGroupRef = useRef(null); // set by ARReticle via callback ref
-  const sessionRef = useRef(null); // cached session so we only setup once
+  const reticleGroupRef = useRef(null);
+  const sessionRef = useRef(null);
   const mat4 = useRef(new THREE.Matrix4());
+  const setupDoneRef = useRef(false);
 
-  // Called by ARReticle to hand us its Three.js group
   const bindReticle = useCallback((group) => {
     reticleGroupRef.current = group;
+    dbg(`reticle bound: ${!!group}`);
   }, []);
 
   useFrame((_, __, frame) => {
     if (!frame) return;
+
     const session = gl.xr?.getSession?.();
     if (!session) return;
 
-    // ── One-time setup (same as onSessionStarted in the reference) ───────────
-    if (sessionRef.current !== session) {
+    // ── One-time session setup ──────────────────────────────────────────────
+    if (session !== sessionRef.current && !setupDoneRef.current) {
       sessionRef.current = session;
+      setupDoneRef.current = true;
+      dbg("session found — setting up hit-test + listeners");
 
-      // requestHitTestSource — exactly like the reference
+      // Hit-test source
       session
         .requestReferenceSpace("local")
         .then((localSpace) => {
           localSpaceRef.current = localSpace;
+          dbg("local refspace OK");
           session
             .requestReferenceSpace("viewer")
             .then((viewerSpace) => {
+              dbg("viewer refspace OK");
               session
                 .requestHitTestSource({ space: viewerSpace })
                 .then((src) => {
                   hitTestSourceRef.current = src;
+                  dbg("hitTestSource OK ✅");
                 })
-                .catch(console.warn);
+                .catch((e) => dbg(`hitTestSource FAIL: ${e}`));
             })
-            .catch(console.warn);
+            .catch((e) => dbg(`viewer refspace FAIL: ${e}`));
         })
-        .catch(console.warn);
+        .catch((e) => dbg(`local refspace FAIL: ${e}`));
 
-      // Register select — exactly like reference's:
-      //   session.addEventListener('select', onSelect)
-      // But we use onselectend so it fires after the tap is released
-      // (avoids the hit-test source not being ready on the very first frame)
-      session.addEventListener("select", () => {
-        // Mirrors: if (reticle.visible) { addARObjectAt(reticle.matrix) }
-        const reticle = reticleGroupRef.current;
-        if (!reticle || !reticle.visible) return;
-        // Read position directly from the reticle group — always fresh, no React state
-        onPlacePreview(reticle.position.clone());
+      // Try ALL possible tap/select event names
+      const tapEvents = [
+        "select",
+        "selectstart",
+        "selectend",
+        "touchstart",
+        "click",
+      ];
+      tapEvents.forEach((evName) => {
+        try {
+          session.addEventListener(evName, (e) => {
+            dbg(`🔥 event: ${evName}`);
+            if (evName !== "select" && evName !== "selectend") return; // only act on select
+            const reticle = reticleGroupRef.current;
+            dbg(
+              `reticle visible: ${reticle?.visible}, pos: ${reticle ? JSON.stringify({ x: reticle.position.x.toFixed(2), y: reticle.position.y.toFixed(2), z: reticle.position.z.toFixed(2) }) : "null"}`,
+            );
+            if (!reticle || !reticle.visible) {
+              dbg("⚠️ reticle not visible — skipping place");
+              return;
+            }
+            dbg("✅ PLACING shelf!");
+            onPlacePreview(reticle.position.clone());
+          });
+          dbg(`registered: ${evName}`);
+        } catch (e) {
+          dbg(`failed to register ${evName}: ${e}`);
+        }
       });
+
+      // Also listen on inputSources for extra coverage
+      dbg(`inputSources count: ${session.inputSources?.length ?? 0}`);
     }
 
-    // ── Per-frame hit-test (same as onXRFrame in the reference) ─────────────
+    // ── Per-frame hit-test ──────────────────────────────────────────────────
     const source = hitTestSourceRef.current;
     const refSpace = localSpaceRef.current;
     const reticle = reticleGroupRef.current;
     if (!reticle) return;
 
-    reticle.visible = false; // default hidden, like reference
+    reticle.visible = false;
 
     if (source && refSpace) {
       const results = frame.getHitTestResults(source);
       if (results.length > 0) {
         const pose = results[0].getPose(refSpace);
         if (pose) {
-          // Mirrors: reticle.visible = true; reticle.matrix = pose.transform.matrix
           reticle.visible = true;
           mat4.current.fromArray(pose.transform.matrix);
           mat4.current.decompose(
@@ -165,10 +222,8 @@ function ARCore({ onPlacePreview, onHasHit }) {
   return <ARReticleInner bindReticle={bindReticle} />;
 }
 
-// Reticle visual — hands its group ref up to ARCore via bindReticle
 function ARReticleInner({ bindReticle }) {
   const pulseRef = useRef();
-
   useFrame(({ clock }) => {
     if (!pulseRef.current) return;
     const t = clock.elapsedTime;
@@ -179,7 +234,6 @@ function ARReticleInner({ bindReticle }) {
     );
     pulseRef.current.material.opacity = 0.2 + 0.12 * Math.sin(t * 3.5);
   });
-
   return (
     <group ref={bindReticle} visible={false}>
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
@@ -222,7 +276,6 @@ function GroceryBox({ position, index, product, isSelected, onClick }) {
   const boxRef = useRef();
   const colors = PRODUCT_COLORS[product] || PRODUCT_COLORS.empty;
   const isEmpty = product === "empty";
-
   useEffect(() => {
     if (!groupRef.current) return;
     gsap.fromTo(
@@ -236,14 +289,12 @@ function GroceryBox({ position, index, product, isSelected, onClick }) {
       },
     );
   }, []);
-
   useFrame(({ clock }) => {
     if (!boxRef.current) return;
     boxRef.current.rotation.y = isSelected
       ? Math.sin(clock.elapsedTime * 2) * 0.15
       : THREE.MathUtils.lerp(boxRef.current.rotation.y, 0, 0.1);
   });
-
   return (
     <group
       ref={groupRef}
@@ -338,7 +389,6 @@ function ShelfBoard({ y, width }) {
     </group>
   );
 }
-
 function ShelfFrame({ height, width }) {
   return (
     <>
@@ -362,7 +412,6 @@ function ShelfFrame({ height, width }) {
   );
 }
 
-// ─── ShelfScene ───────────────────────────────────────────────────────────────
 function ShelfScene({
   items,
   selectedIndex,
@@ -373,11 +422,10 @@ function ShelfScene({
   onPlacePreview,
   onHasHit,
 }) {
-  const ITEM_W = 0.95;
-  const ROW = Math.ceil(items.length / 2);
-  const SHELF_Y = [-0.3, 1.15];
-  const AR_SCALE = 0.28;
-
+  const ITEM_W = 0.95,
+    ROW = Math.ceil(items.length / 2),
+    SHELF_Y = [-0.3, 1.15],
+    AR_SCALE = 0.28;
   const shelfProps =
     isAR && anchorPos
       ? {
@@ -385,10 +433,8 @@ function ShelfScene({
           scale: [AR_SCALE, AR_SCALE, AR_SCALE],
         }
       : { position: [0, -0.6, 0], scale: [1, 1, 1] };
-
   const showShelf =
     !isAR || placeState === PS.PREVIEWING || placeState === PS.CONFIRMED;
-
   const renderRow = (row, startIdx, shelfY) =>
     row.map((product, i) => (
       <GroceryBox
@@ -400,7 +446,6 @@ function ShelfScene({
         onClick={onSelect}
       />
     ));
-
   return (
     <>
       <ambientLight intensity={isAR ? 1.0 : 0.6} />
@@ -415,12 +460,9 @@ function ShelfScene({
         color="#b0c4de"
       />
       <pointLight position={[0, 3, 2]} intensity={0.5} color="#fff5e0" />
-
-      {/* ARCore owns both hit-test + select listener, only while scanning */}
       {isAR && placeState === PS.SCANNING && (
         <ARCore onPlacePreview={onPlacePreview} onHasHit={onHasHit} />
       )}
-
       {showShelf && (
         <group {...shelfProps}>
           <ShelfFrame height={2.4} width={ROW * ITEM_W} />
@@ -430,7 +472,6 @@ function ShelfScene({
           {renderRow(items.slice(ROW), ROW, SHELF_Y[1])}
         </group>
       )}
-
       {!isAR && (
         <>
           <OrbitControls
@@ -520,7 +561,6 @@ function ARHud({
           </div>
         </div>
       )}
-
       {placeState === PS.PREVIEWING && (
         <div
           style={{
@@ -593,7 +633,6 @@ function ARHud({
           </div>
         </div>
       )}
-
       {placeState === PS.CONFIRMED && (
         <>
           <div
@@ -904,12 +943,11 @@ export default function GroceryShelf() {
     insertProduct: "milk",
     updateProduct: "juice",
   });
-
   const [isAR, setIsAR] = useState(false);
   const [placeState, setPlaceState] = useState(PS.SCANNING);
   const [anchorPos, setAnchorPos] = useState(null);
   const [hasHit, setHasHit] = useState(false);
-
+  const [showDebug, setShowDebug] = useState(true); // ON by default so you can see it
   const arSupported = useARSupport();
 
   const addLog = (msg, type = "info") =>
@@ -935,10 +973,7 @@ export default function GroceryShelf() {
     n.splice(i, 0, inputs.insertProduct);
     setItems(n.slice(0, INITIAL_ITEMS.length));
     setSelectedIndex(i);
-    addLog(
-      `➕ Insert "${inputs.insertProduct}" at [${i}]  ·  Shifted ${items.length - i} right  ·  O(n)`,
-      "success",
-    );
+    addLog(`➕ Insert "${inputs.insertProduct}" at [${i}]  ·  O(n)`, "success");
   };
   const handleDelete = () => {
     const i = +inputs.deleteIdx;
@@ -950,10 +985,7 @@ export default function GroceryShelf() {
     n.push("empty");
     setItems(n);
     setSelectedIndex(null);
-    addLog(
-      `🗑️ Delete [${i}] "${r}"  ·  Shifted ${items.length - i - 1} left  ·  O(n)`,
-      "success",
-    );
+    addLog(`🗑️ Delete [${i}] "${r}"  ·  O(n)`, "success");
   };
   const handleUpdate = () => {
     if (selectedIndex === null)
@@ -974,10 +1006,24 @@ export default function GroceryShelf() {
   };
 
   const handleEnterAR = useCallback(async () => {
+    debugLines.length = 0; // clear debug on enter
+    dbg("entering AR...");
     setPlaceState(PS.SCANNING);
     setAnchorPos(null);
     setHasHit(false);
-    await xrStore.enterAR({ requiredFeatures: ["local", "hit-test"] });
+    try {
+      await xrStore.enterAR({ requiredFeatures: ["local", "hit-test"] });
+      dbg("xrStore.enterAR() resolved");
+    } catch (e) {
+      dbg(`enterAR FAILED: ${e}`);
+      // try without options as fallback
+      try {
+        await xrStore.enterAR();
+        dbg("xrStore.enterAR() (no opts) resolved");
+      } catch (e2) {
+        dbg(`enterAR (no opts) FAILED: ${e2}`);
+      }
+    }
     setIsAR(true);
   }, []);
 
@@ -991,9 +1037,10 @@ export default function GroceryShelf() {
     setHasHit(false);
   }, []);
 
-  // Called by ARCore when user taps with reticle visible
-  // pos is reticle.position.clone() — always the live Three.js value
   const handlePlacePreview = useCallback((pos) => {
+    dbg(
+      `handlePlacePreview called: ${JSON.stringify({ x: pos.x.toFixed(2), y: pos.y.toFixed(2), z: pos.z.toFixed(2) })}`,
+    );
     setAnchorPos(pos);
     setPlaceState(PS.PREVIEWING);
   }, []);
@@ -1020,6 +1067,9 @@ export default function GroceryShelf() {
       className="flex flex-col gap-4 w-full"
       style={{ fontFamily: "'Courier New',monospace" }}
     >
+      {/* Debug overlay — visible in AR */}
+      <DebugOverlay visible={isAR && showDebug} />
+
       <ARHud
         isAR={isAR}
         placeState={placeState}
@@ -1060,8 +1110,17 @@ export default function GroceryShelf() {
       </div>
 
       {arSupported === false && <ARUnsupportedBanner />}
+
       {!isAR && (
-        <div className="flex justify-end">
+        <div className="flex justify-between items-center">
+          <label className="flex items-center gap-2 text-white/50 text-sm cursor-pointer">
+            <input
+              type="checkbox"
+              checked={showDebug}
+              onChange={(e) => setShowDebug(e.target.checked)}
+            />
+            Show AR debug overlay
+          </label>
           {arSupported === null && (
             <button
               disabled
@@ -1126,7 +1185,6 @@ export default function GroceryShelf() {
               </button>
             ))}
           </div>
-
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
               <div className="flex gap-2 mb-4 flex-wrap">
@@ -1163,7 +1221,7 @@ export default function GroceryShelf() {
               {activeTab === "insert" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Insert at index, shifts right —{" "}
+                    Insert at index —{" "}
                     <span className="text-red-400 font-bold">O(n)</span>
                   </p>
                   <div className="flex gap-2 items-center flex-wrap">
@@ -1201,7 +1259,7 @@ export default function GroceryShelf() {
               {activeTab === "delete" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Remove at index, shifts left —{" "}
+                    Remove at index —{" "}
                     <span className="text-red-400 font-bold">O(n)</span>
                   </p>
                   <div className="flex gap-2 items-center">
