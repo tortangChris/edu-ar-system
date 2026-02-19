@@ -1,23 +1,19 @@
 import { useRef, useState, useEffect, useCallback } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Canvas, useFrame } from "@react-three/fiber";
 import {
   Text,
   RoundedBox,
   OrbitControls,
   Environment,
 } from "@react-three/drei";
-import {
-  XR,
-  createXRStore,
-  useXRSessionVisibilityState,
-} from "@react-three/xr";
+import { XR, createXRStore } from "@react-three/xr";
 import { gsap } from "gsap";
 import * as THREE from "three";
 
-// ─── XR Store ──────────────────────────────────────────────────────────────────
+// ─── XR Store ─────────────────────────────────────────────────────────────────
 const xrStore = createXRStore();
 
-// ─── Constants ─────────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 const CAR_SPACING = 1.85;
 const CAR_W = 0.9;
 const CAR_H = 0.42;
@@ -26,6 +22,7 @@ const LANE_Z = 0;
 const ROAD_Y = -0.82;
 const MAX_QUEUE = 7;
 const GATE_X = -3.8;
+const AR_SCALE = 0.13;
 
 const CAR_STYLES = [
   { body: "#e74c3c", roof: "#c0392b", name: "Sedan", plate: "ABC 001" },
@@ -38,10 +35,489 @@ const CAR_STYLES = [
   { body: "#e91e63", roof: "#c2185b", name: "Mini", plate: "STU 008" },
 ];
 
-// ─── 3D Car Model ──────────────────────────────────────────────────────────────
+// helper: lighten a hex color
+function lightenHex(hex) {
+  const n = parseInt(hex.replace("#", ""), 16);
+  const r = Math.min(255, ((n >> 16) & 0xff) + 45);
+  const g = Math.min(255, ((n >> 8) & 0xff) + 45);
+  const b = Math.min(255, (n & 0xff) + 45);
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
+}
+
+// ─── 3D Button ────────────────────────────────────────────────────────────────
+function Button3D({
+  position,
+  label,
+  subLabel,
+  color,
+  textColor = "#fff",
+  width = 1.6,
+  height = 0.5,
+  disabled = false,
+  onClick,
+}) {
+  const meshRef = useRef();
+  const [hovered, setHovered] = useState(false);
+  const [pressed, setPressed] = useState(false);
+
+  useFrame(() => {
+    if (!meshRef.current) return;
+    const ty = pressed ? -0.04 : hovered ? 0.05 : 0;
+    meshRef.current.position.y += (ty - meshRef.current.position.y) * 0.2;
+  });
+
+  const col = disabled
+    ? "#2a2a2a"
+    : pressed
+      ? lightenHex(lightenHex(color))
+      : hovered
+        ? lightenHex(color)
+        : color;
+
+  return (
+    <group position={position}>
+      {/* Drop shadow */}
+      <mesh position={[0, -0.06, -0.02]}>
+        <boxGeometry args={[width, height, 0.07]} />
+        <meshStandardMaterial
+          color="#000"
+          transparent
+          opacity={0.3}
+          roughness={1}
+        />
+      </mesh>
+      <group ref={meshRef}>
+        <RoundedBox
+          args={[width, height, 0.14]}
+          radius={0.09}
+          smoothness={4}
+          onPointerEnter={() => {
+            if (!disabled) setHovered(true);
+          }}
+          onPointerLeave={() => {
+            setHovered(false);
+            setPressed(false);
+          }}
+          onPointerDown={() => {
+            if (!disabled) setPressed(true);
+          }}
+          onPointerUp={() => {
+            if (!disabled && pressed) onClick?.();
+            setPressed(false);
+          }}
+        >
+          <meshStandardMaterial
+            color={col}
+            emissive={hovered && !disabled ? color : "#000"}
+            emissiveIntensity={hovered && !disabled ? 0.35 : 0}
+            roughness={0.25}
+            metalness={0.1}
+            transparent
+            opacity={disabled ? 0.3 : 1}
+          />
+        </RoundedBox>
+        <Text
+          position={[0, subLabel ? 0.08 : 0, 0.08]}
+          fontSize={0.155}
+          color={disabled ? "#555" : textColor}
+          anchorX="center"
+          anchorY="middle"
+        >
+          {label}
+        </Text>
+        {subLabel && (
+          <Text
+            position={[0, -0.11, 0.08]}
+            fontSize={0.09}
+            color={disabled ? "#444" : "rgba(255,255,255,0.55)"}
+            anchorX="center"
+            anchorY="middle"
+          >
+            {subLabel}
+          </Text>
+        )}
+      </group>
+    </group>
+  );
+}
+
+// ─── 3D Car Selector Chip ─────────────────────────────────────────────────────
+function CarChip({ position, style, isSelected, onClick }) {
+  const ref = useRef();
+  const [hov, setHov] = useState(false);
+  useFrame(() => {
+    if (!ref.current) return;
+    const s = isSelected ? 1.1 : hov ? 1.05 : 1;
+    ref.current.scale.lerp(new THREE.Vector3(s, s, s), 0.15);
+  });
+  return (
+    <group ref={ref} position={position}>
+      <RoundedBox
+        args={[0.92, 0.38, 0.1]}
+        radius={0.06}
+        smoothness={4}
+        onPointerEnter={() => setHov(true)}
+        onPointerLeave={() => setHov(false)}
+        onPointerUp={() => onClick?.()}
+      >
+        <meshStandardMaterial
+          color={isSelected ? style.body : "#16213e"}
+          emissive={isSelected ? style.body : "#000"}
+          emissiveIntensity={isSelected ? 0.35 : 0}
+          roughness={0.3}
+          metalness={0.15}
+        />
+      </RoundedBox>
+      <Text
+        position={[0, 0.06, 0.06]}
+        fontSize={0.105}
+        color={isSelected ? "#fff" : "#888"}
+        anchorX="center"
+        anchorY="middle"
+      >
+        🚗 {style.name}
+      </Text>
+      <Text
+        position={[0, -0.09, 0.06]}
+        fontSize={0.072}
+        color={isSelected ? "#fffa" : "#444"}
+        anchorX="center"
+        anchorY="middle"
+      >
+        {style.plate}
+      </Text>
+    </group>
+  );
+}
+
+// ─── 3D Status Panel ─────────────────────────────────────────────────────────
+function StatusPanel({
+  position,
+  queue,
+  isGateOpen,
+  frontCar,
+  rearCar,
+  lastLog,
+  autoMode,
+}) {
+  return (
+    <group position={position}>
+      <RoundedBox args={[5.4, 1.85, 0.09]} radius={0.11} smoothness={4}>
+        <meshStandardMaterial
+          color="#04091a"
+          transparent
+          opacity={0.9}
+          roughness={0.5}
+          metalness={0.05}
+        />
+      </RoundedBox>
+      {/* border */}
+      <RoundedBox
+        args={[5.42, 1.87, 0.07]}
+        radius={0.11}
+        smoothness={4}
+        position={[0, 0, -0.01]}
+      >
+        <meshStandardMaterial
+          color="#163358"
+          transparent
+          opacity={0.55}
+          roughness={1}
+        />
+      </RoundedBox>
+
+      <Text
+        position={[-2.0, 0.72, 0.06]}
+        fontSize={0.195}
+        color="#fbbf24"
+        anchorX="left"
+        anchorY="middle"
+      >
+        🚗 CAR TOLL GATE — AR MODE
+      </Text>
+      {autoMode && (
+        <Text
+          position={[1.8, 0.72, 0.06]}
+          fontSize={0.13}
+          color="#fbbf24"
+          anchorX="left"
+          anchorY="middle"
+        >
+          ● AUTO
+        </Text>
+      )}
+
+      <Text
+        position={[-2.0, 0.38, 0.06]}
+        fontSize={0.125}
+        color="#94a3b8"
+        anchorX="left"
+        anchorY="middle"
+      >
+        {`Queue: ${queue.length}/${MAX_QUEUE}  ·  Gate: ${isGateOpen ? "🟢 OPEN" : "🔴 CLOSED"}`}
+      </Text>
+      <Text
+        position={[-2.0, 0.1, 0.06]}
+        fontSize={0.115}
+        color="#4ade80"
+        anchorX="left"
+        anchorY="middle"
+      >
+        {frontCar
+          ? `FRONT [0]: ${CAR_STYLES[frontCar.styleIdx].name}  (${CAR_STYLES[frontCar.styleIdx].plate})`
+          : "FRONT: empty"}
+      </Text>
+      <Text
+        position={[-2.0, -0.14, 0.06]}
+        fontSize={0.115}
+        color="#f87171"
+        anchorX="left"
+        anchorY="middle"
+      >
+        {rearCar && queue.length > 1
+          ? `REAR  [${queue.length - 1}]: ${CAR_STYLES[rearCar.styleIdx].name}`
+          : queue.length === 1 && frontCar
+            ? "REAR = FRONT"
+            : "REAR: empty"}
+      </Text>
+
+      {/* progress bar bg */}
+      <mesh position={[0, -0.44, 0.05]}>
+        <boxGeometry args={[4.6, 0.1, 0.01]} />
+        <meshStandardMaterial color="#1e293b" />
+      </mesh>
+      {/* progress fill */}
+      {queue.length > 0 && (
+        <mesh position={[-2.3 + (queue.length / MAX_QUEUE) * 2.3, -0.44, 0.06]}>
+          <boxGeometry args={[(queue.length / MAX_QUEUE) * 4.6, 0.1, 0.01]} />
+          <meshStandardMaterial
+            color="#fbbf24"
+            emissive="#fbbf24"
+            emissiveIntensity={0.5}
+          />
+        </mesh>
+      )}
+
+      {lastLog && (
+        <Text
+          position={[-2.0, -0.68, 0.06]}
+          fontSize={0.105}
+          color={
+            lastLog.type === "success"
+              ? "#4ade80"
+              : lastLog.type === "error"
+                ? "#f87171"
+                : "#60a5fa"
+          }
+          anchorX="left"
+          anchorY="middle"
+          maxWidth={5}
+        >
+          {lastLog.msg}
+        </Text>
+      )}
+    </group>
+  );
+}
+
+// ─── 3D Control Panel ─────────────────────────────────────────────────────────
+function ControlPanel({
+  position,
+  queue,
+  isAnimating,
+  autoMode,
+  enqueueStyleIdx,
+  onEnqueue,
+  onDequeue,
+  onPeek,
+  onToggleAuto,
+  onReset,
+  onSelectStyle,
+  frontCar,
+}) {
+  return (
+    <group position={position}>
+      {/* bg panel */}
+      <RoundedBox
+        args={[8.2, 4.4, 0.08]}
+        radius={0.13}
+        smoothness={4}
+        position={[0, 0, -0.05]}
+      >
+        <meshStandardMaterial
+          color="#03070f"
+          transparent
+          opacity={0.92}
+          roughness={0.5}
+        />
+      </RoundedBox>
+      <RoundedBox
+        args={[8.22, 4.42, 0.065]}
+        radius={0.13}
+        smoothness={4}
+        position={[0, 0, -0.06]}
+      >
+        <meshStandardMaterial
+          color="#0d2340"
+          transparent
+          opacity={0.6}
+          roughness={1}
+        />
+      </RoundedBox>
+
+      {/* section label */}
+      <Text
+        position={[-3.7, 1.85, 0]}
+        fontSize={0.12}
+        color="#475569"
+        anchorX="left"
+        anchorY="middle"
+      >
+        ── QUEUE OPERATIONS ─────────────────────
+      </Text>
+
+      {/* Main action buttons */}
+      <Button3D
+        position={[-2.7, 1.38, 0]}
+        label="🚗  ENQUEUE"
+        subLabel={`→ ${CAR_STYLES[enqueueStyleIdx].name} joins REAR  O(1)`}
+        color="#1d4ed8"
+        width={2.5}
+        height={0.58}
+        disabled={isAnimating || queue.length >= MAX_QUEUE}
+        onClick={onEnqueue}
+      />
+      <Button3D
+        position={[0.3, 1.38, 0]}
+        label="✅  DEQUEUE"
+        subLabel="← removes FRONT car  O(1)"
+        color="#15803d"
+        width={2.5}
+        height={0.58}
+        disabled={isAnimating || queue.length === 0}
+        onClick={onDequeue}
+      />
+      <Button3D
+        position={[3.1, 1.38, 0]}
+        label="👁️  PEEK"
+        subLabel={
+          frontCar
+            ? `FRONT = ${CAR_STYLES[frontCar.styleIdx].name}`
+            : "queue empty"
+        }
+        color="#92400e"
+        width={2.0}
+        height={0.58}
+        disabled={queue.length === 0}
+        onClick={onPeek}
+      />
+
+      {/* car selector */}
+      <Text
+        position={[-3.7, 0.68, 0]}
+        fontSize={0.12}
+        color="#475569"
+        anchorX="left"
+        anchorY="middle"
+      >
+        ── SELECT CAR TYPE ──────────────────────
+      </Text>
+      {CAR_STYLES.slice(0, 4).map((s, i) => (
+        <CarChip
+          key={i}
+          position={[-3.0 + i * 1.07, 0.25, 0]}
+          style={s}
+          isSelected={enqueueStyleIdx === i}
+          onClick={() => onSelectStyle(i)}
+        />
+      ))}
+      {CAR_STYLES.slice(4).map((s, i) => (
+        <CarChip
+          key={i + 4}
+          position={[-3.0 + i * 1.07, -0.3, 0]}
+          style={s}
+          isSelected={enqueueStyleIdx === i + 4}
+          onClick={() => onSelectStyle(i + 4)}
+        />
+      ))}
+
+      {/* utilities */}
+      <Text
+        position={[-3.7, -0.85, 0]}
+        fontSize={0.12}
+        color="#475569"
+        anchorX="left"
+        anchorY="middle"
+      >
+        ── UTILITIES ────────────────────────────
+      </Text>
+      <Button3D
+        position={[-2.3, -1.25, 0]}
+        label={autoMode ? "⏹  STOP AUTO" : "⚡  AUTO FLOW"}
+        subLabel={autoMode ? "stop simulation" : "simulate traffic"}
+        color={autoMode ? "#991b1b" : "#5b21b6"}
+        width={2.8}
+        height={0.58}
+        onClick={onToggleAuto}
+      />
+      <Button3D
+        position={[1.5, -1.25, 0]}
+        label="🔄  RESET"
+        subLabel="restore default queue"
+        color="#1e293b"
+        width={2.1}
+        height={0.58}
+        disabled={isAnimating}
+        onClick={onReset}
+      />
+
+      {/* complexity table */}
+      <Text
+        position={[-3.7, -1.9, 0]}
+        fontSize={0.12}
+        color="#475569"
+        anchorX="left"
+        anchorY="middle"
+      >
+        ── TIME COMPLEXITY ──────────────────────
+      </Text>
+      {[
+        ["Enqueue (rear)", "O(1)", true, -3.1],
+        ["Dequeue (front)", "O(1)", true, -0.8],
+        ["Peek front", "O(1)", true, 1.3],
+        ["Search", "O(n)", false, 3.4],
+      ].map(([op, c, fast, x]) => (
+        <group key={op} position={[x, -2.22, 0]}>
+          <RoundedBox args={[1.85, 0.32, 0.07]} radius={0.05} smoothness={4}>
+            <meshStandardMaterial color="#0f172a" roughness={0.5} />
+          </RoundedBox>
+          <Text
+            position={[-0.68, 0, 0.05]}
+            fontSize={0.1}
+            color="#94a3b8"
+            anchorX="left"
+            anchorY="middle"
+          >
+            {op}
+          </Text>
+          <Text
+            position={[0.72, 0, 0.05]}
+            fontSize={0.115}
+            color={fast ? "#4ade80" : "#f87171"}
+            anchorX="right"
+            anchorY="middle"
+          >
+            {c}
+          </Text>
+        </group>
+      ))}
+    </group>
+  );
+}
+
+// ─── 3D Car ────────────────────────────────────────────────────────────────────
 function Car({
   queueIndex,
-  carCount,
   style,
   isFront,
   isRear,
@@ -51,10 +527,10 @@ function Car({
   onEnterDone,
 }) {
   const groupRef = useRef();
-  const wheelFL = useRef();
-  const wheelFR = useRef();
-  const wheelBL = useRef();
-  const wheelBR = useRef();
+  const wheelFL = useRef(),
+    wheelFR = useRef(),
+    wheelBL = useRef(),
+    wheelBR = useRef();
   const lightRef = useRef();
   const targetX = GATE_X + CAR_SPACING + queueIndex * CAR_SPACING;
 
@@ -105,16 +581,15 @@ function Car({
     }
   }, [isExiting]);
 
-  useFrame((state) => {
-    const spin = state.clock.elapsedTime * 4;
+  useFrame(({ clock }) => {
+    const spin = clock.elapsedTime * 4;
     if (wheelFL.current) wheelFL.current.rotation.z = spin;
     if (wheelFR.current) wheelFR.current.rotation.z = spin;
     if (wheelBL.current) wheelBL.current.rotation.z = spin;
     if (wheelBR.current) wheelBR.current.rotation.z = spin;
-    if (lightRef.current && isFront) {
+    if (lightRef.current && isFront)
       lightRef.current.material.emissiveIntensity =
-        0.5 + Math.sin(state.clock.elapsedTime * 3) * 0.3;
-    }
+        0.5 + Math.sin(clock.elapsedTime * 3) * 0.3;
   });
 
   return (
@@ -298,7 +773,7 @@ function Car({
   );
 }
 
-// ─── Toll Gate Structure ───────────────────────────────────────────────────────
+// ─── Toll Gate ─────────────────────────────────────────────────────────────────
 function TollGate({ isOpen }) {
   const armRef = useRef();
   useEffect(() => {
@@ -309,7 +784,6 @@ function TollGate({ isOpen }) {
       ease: "power2.inOut",
     });
   }, [isOpen]);
-
   return (
     <group position={[GATE_X, ROAD_Y, 0]}>
       <RoundedBox
@@ -327,15 +801,6 @@ function TollGate({ isOpen }) {
       <mesh position={[0, 1.64, -0.85]}>
         <boxGeometry args={[0.76, 0.1, 0.96]} />
         <meshStandardMaterial color="#2ecc71" roughness={0.5} />
-      </mesh>
-      <mesh position={[0.36, 0.95, -0.85]}>
-        <boxGeometry args={[0.02, 0.5, 0.55]} />
-        <meshStandardMaterial
-          color="#a0d4f5"
-          roughness={0.1}
-          transparent
-          opacity={0.7}
-        />
       </mesh>
       <mesh position={[0, 1.85, -0.85]}>
         <boxGeometry args={[0.65, 0.28, 0.06]} />
@@ -359,10 +824,10 @@ function TollGate({ isOpen }) {
           <boxGeometry args={[2.7, 0.08, 0.08]} />
           <meshStandardMaterial
             color={isOpen ? "#2ecc71" : "#e74c3c"}
-            roughness={0.4}
-            metalness={0.2}
             emissive={isOpen ? "#2ecc71" : "#e74c3c"}
             emissiveIntensity={0.35}
+            roughness={0.4}
+            metalness={0.2}
           />
         </mesh>
         {[0.5, 1.0, 1.5, 2.0, 2.5].map((x, i) => (
@@ -400,7 +865,7 @@ function TollGate({ isOpen }) {
   );
 }
 
-// ─── Road & Floor ──────────────────────────────────────────────────────────────
+// ─── Road ─────────────────────────────────────────────────────────────────────
 function Road({ queueLength }) {
   const roadLen = 24;
   return (
@@ -446,35 +911,57 @@ function Road({ queueLength }) {
   );
 }
 
-// ─── AR Scene (no environment, transparent bg) ────────────────────────────────
-function ARScene({
+// ─── Full AR World — everything is 3D, camera-facing panels ──────────────────
+function ARWorld({
   queue,
   exitingId,
   enteringId,
   isGateOpen,
+  isAnimating,
+  autoMode,
+  enqueueStyleIdx,
+  frontCar,
+  rearCar,
+  lastLog,
   onExitDone,
   onEnterDone,
+  onEnqueue,
+  onDequeue,
+  onPeek,
+  onToggleAuto,
+  onReset,
+  onSelectStyle,
+  onExitAR,
 }) {
+  const uiRef = useRef();
+
+  // Panels always face the camera (billboard Y)
+  useFrame(({ camera }) => {
+    if (!uiRef.current) return;
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    uiRef.current.rotation.y = Math.atan2(dir.x, dir.z);
+  });
+
   return (
     <>
-      <ambientLight intensity={1.2} />
-      <directionalLight position={[6, 10, 4]} intensity={1.5} castShadow />
+      <ambientLight intensity={1.5} />
+      <directionalLight position={[5, 8, 4]} intensity={1.7} castShadow />
       <directionalLight
-        position={[-4, 5, -2]}
-        intensity={0.6}
-        color="#b0c8e0"
+        position={[-3, 4, -2]}
+        intensity={0.55}
+        color="#b0c8ff"
       />
-      <pointLight position={[GATE_X, 2.5, 0]} intensity={1.2} color="#ffe8a0" />
+      <pointLight position={[0, 1.5, 0]} intensity={0.8} color="#ffe8a0" />
 
-      {/* Scale down for AR — scene sits at ground level in front of user */}
-      <group scale={0.15} position={[0, -0.3, -2]}>
+      {/* The toll gate world, scaled for AR */}
+      <group scale={AR_SCALE} position={[0, -0.6, -2.0]}>
         <Road queueLength={queue.length} />
         <TollGate isOpen={isGateOpen} />
         {queue.map((car, i) => (
           <Car
             key={car.id}
             queueIndex={i}
-            carCount={queue.length}
             style={CAR_STYLES[car.styleIdx]}
             isFront={i === 0}
             isRear={i === queue.length - 1}
@@ -492,16 +979,57 @@ function ARScene({
             anchorX="center"
             anchorY="middle"
           >
-            Queue Empty — Enqueue a car!
+            Queue Empty — Tap ENQUEUE!
           </Text>
         )}
+      </group>
+
+      {/* 3D UI panels — float in front of user, face camera */}
+      <group ref={uiRef} position={[0, 0.08, -2.1]}>
+        {/* Status panel — floats ABOVE the scene */}
+        <StatusPanel
+          position={[0, 0.72, 0]}
+          queue={queue}
+          isGateOpen={isGateOpen}
+          frontCar={frontCar}
+          rearCar={rearCar}
+          lastLog={lastLog}
+          autoMode={autoMode}
+        />
+
+        {/* Control panel — floats BELOW the scene */}
+        <ControlPanel
+          position={[0, -0.68, 0]}
+          queue={queue}
+          isAnimating={isAnimating}
+          autoMode={autoMode}
+          enqueueStyleIdx={enqueueStyleIdx}
+          frontCar={frontCar}
+          onEnqueue={onEnqueue}
+          onDequeue={onDequeue}
+          onPeek={onPeek}
+          onToggleAuto={onToggleAuto}
+          onReset={onReset}
+          onSelectStyle={onSelectStyle}
+        />
+
+        {/* Exit AR button — top-right corner */}
+        <Button3D
+          position={[3.8, 0.72, 0.02]}
+          label="✕  EXIT AR"
+          color="#7f1d1d"
+          textColor="#fca5a5"
+          width={1.3}
+          height={0.38}
+          onClick={onExitAR}
+        />
       </group>
     </>
   );
 }
 
-// ─── 3D Scene (non-AR fallback) ───────────────────────────────────────────────
-function TollScene({
+// ─── Regular 3D Scene (non-AR) ────────────────────────────────────────────────
+function Scene3D({
   queue,
   exitingId,
   enteringId,
@@ -519,14 +1047,12 @@ function TollScene({
         color="#b0c8e0"
       />
       <pointLight position={[GATE_X, 2.5, 0]} intensity={0.8} color="#ffe8a0" />
-      <pointLight position={[2, 2, 0]} intensity={0.35} color="#ffffff" />
       <Road queueLength={queue.length} />
       <TollGate isOpen={isGateOpen} />
       {queue.map((car, i) => (
         <Car
           key={car.id}
           queueIndex={i}
-          carCount={queue.length}
           style={CAR_STYLES[car.styleIdx]}
           isFront={i === 0}
           isRear={i === queue.length - 1}
@@ -560,7 +1086,7 @@ function TollScene({
   );
 }
 
-// ─── Main Export ───────────────────────────────────────────────────────────────
+// ─── Main Component ────────────────────────────────────────────────────────────
 const INITIAL_QUEUE = [
   { id: 1, styleIdx: 0 },
   { id: 2, styleIdx: 1 },
@@ -583,23 +1109,21 @@ export default function CarTollGate() {
   const [arError, setArError] = useState(null);
   const autoRef = useRef(null);
 
-  // Check AR support
   useEffect(() => {
     if (navigator.xr) {
       navigator.xr
         .isSessionSupported("immersive-ar")
-        .then((supported) => {
-          setArSupported(supported);
-        })
+        .then(setArSupported)
         .catch(() => setArSupported(false));
     }
   }, []);
 
   const addLog = (msg, type = "info") =>
-    setLog((prev) => [{ msg, type, id: Date.now() }, ...prev].slice(0, 8));
+    setLog((p) => [{ msg, type, id: Date.now() }, ...p].slice(0, 8));
 
   const frontCar = queue.length > 0 ? queue[0] : null;
   const rearCar = queue.length > 0 ? queue[queue.length - 1] : null;
+  const lastLog = log[0] || null;
 
   const handleEnqueue = useCallback(() => {
     if (isAnimating) return;
@@ -607,7 +1131,7 @@ export default function CarTollGate() {
       return addLog(`⚠️ Queue Full! Max ${MAX_QUEUE} cars.`, "error");
     setIsAnimating(true);
     const newCar = { id: nextCarId++, styleIdx: enqueueStyleIdx };
-    setQueue((prev) => [...prev, newCar]);
+    setQueue((p) => [...p, newCar]);
     setEnteringId(newCar.id);
     addLog(
       `🚗 Enqueue "${CAR_STYLES[enqueueStyleIdx].name}" → joins REAR [${queue.length}]  ·  O(1)`,
@@ -621,47 +1145,42 @@ export default function CarTollGate() {
   };
 
   const handleDequeue = useCallback(() => {
-    if (isAnimating) return;
-    if (queue.length === 0)
-      return addLog("⚠️ Queue Empty! No cars to dequeue.", "error");
+    if (isAnimating || queue.length === 0) return;
     setIsAnimating(true);
     setIsGateOpen(true);
     const front = queue[0];
     setExitingId(front.id);
     addLog(
-      `✅ Dequeue "${CAR_STYLES[front.styleIdx].name}" exits FRONT [0]  ·  O(1)  ·  Gate opens!`,
+      `✅ Dequeue "${CAR_STYLES[front.styleIdx].name}" exits FRONT [0]  ·  O(1)`,
       "success",
     );
   }, [isAnimating, queue]);
 
   const handleExitDone = () => {
-    setQueue((prev) => prev.slice(1));
+    setQueue((p) => p.slice(1));
     setExitingId(null);
     setIsAnimating(false);
     setTimeout(() => setIsGateOpen(false), 400);
   };
 
-  const handlePeek = () => {
+  const handlePeek = useCallback(() => {
     if (queue.length === 0) return addLog("⚠️ Queue is empty!", "error");
     addLog(
       `👁️ Peek FRONT [0] = "${CAR_STYLES[frontCar.styleIdx].name}" (${CAR_STYLES[frontCar.styleIdx].plate})  ·  O(1)`,
       "success",
     );
-  };
+  }, [queue, frontCar]);
 
-  const toggleAuto = () => {
+  const toggleAuto = useCallback(() => {
     if (autoMode) {
       clearInterval(autoRef.current);
       setAutoMode(false);
       addLog("⏹ Auto mode stopped", "info");
     } else {
       setAutoMode(true);
-      addLog(
-        "▶ Auto mode started — cars joining and leaving automatically",
-        "info",
-      );
+      addLog("▶ Auto mode started", "info");
     }
-  };
+  }, [autoMode]);
 
   useEffect(() => {
     if (!autoMode) return;
@@ -708,244 +1227,126 @@ export default function CarTollGate() {
     return () => clearInterval(autoRef.current);
   }, [autoMode, isAnimating]);
 
-  const handleReset = () => {
+  const handleReset = useCallback(() => {
     if (isAnimating) return;
     clearInterval(autoRef.current);
     setAutoMode(false);
     setQueue(INITIAL_QUEUE);
     setIsGateOpen(false);
     setLog([]);
-  };
+  }, [isAnimating]);
 
-  // ── Launch AR ──────────────────────────────────────────────────────────────
   const handleLaunchAR = () => {
     setArError(null);
     xrStore
       .enterAR()
-      .then(() => {
-        setIsARMode(true);
-      })
-      .catch((err) => {
-        setArError("AR failed to start: " + (err?.message || "Unknown error"));
-      });
+      .then(() => setIsARMode(true))
+      .catch((e) => setArError("AR failed: " + (e?.message || "Unknown")));
+  };
+  const handleExitAR = () => {
+    try {
+      xrStore.getState()?.session?.end();
+    } catch {}
+    setIsARMode(false);
   };
 
   const tabBtn = (tab, emoji, label) => (
     <button
       key={tab}
       onClick={() => setActiveTab(tab)}
-      className={`px-3 py-2 rounded-lg text-sm font-bold transition-all border-2 ${
-        activeTab === tab
-          ? "bg-yellow-400 border-yellow-400 text-gray-900"
-          : "bg-transparent border-white/20 text-white/60 hover:border-yellow-400/50 hover:text-white"
-      }`}
+      className={`px-3 py-2 rounded-lg text-sm font-bold transition-all border-2 ${activeTab === tab ? "bg-yellow-400 border-yellow-400 text-gray-900" : "bg-transparent border-white/20 text-white/60 hover:border-yellow-400/50 hover:text-white"}`}
     >
       {emoji} {label}
     </button>
   );
 
-  // ── AR Overlay UI (shown on top of camera in AR mode) ─────────────────────
-  const arHUD = (
+  return (
     <div
-      style={{
-        position: "fixed",
-        bottom: 0,
-        left: 0,
-        right: 0,
-        zIndex: 9999,
-        padding: "12px 16px",
-        background:
-          "linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 100%)",
-        fontFamily: "'Courier New', monospace",
-        pointerEvents: "auto",
-      }}
+      className="flex flex-col gap-4 w-full"
+      style={{ fontFamily: "'Courier New', monospace" }}
     >
-      {/* AR status bar */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 8,
-        }}
-      >
-        <span
-          style={{
-            color: "#4ade80",
-            fontWeight: "bold",
-            fontSize: 12,
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-          }}
-        >
-          <span
-            style={{
-              width: 8,
-              height: 8,
-              background: "#4ade80",
-              borderRadius: "50%",
-              display: "inline-block",
-              boxShadow: "0 0 6px #4ade80",
-            }}
-          />
-          AR LIVE · Queue: {queue.length}/{MAX_QUEUE}
-        </span>
-        <button
-          onClick={() => {
-            xrStore.getState()?.session?.end();
-            setIsARMode(false);
-          }}
-          style={{
-            background: "rgba(239,68,68,0.8)",
-            border: "none",
-            color: "white",
-            borderRadius: 8,
-            padding: "4px 12px",
-            fontWeight: "bold",
-            fontSize: 12,
-            cursor: "pointer",
-          }}
-        >
-          ✕ EXIT AR
-        </button>
+      {/* Header */}
+      <div className="text-center">
+        <h2 className="text-3xl font-bold text-yellow-300 tracking-widest">
+          🚗 CAR TOLL GATE
+        </h2>
+        <p className="text-white/50 text-sm mt-1">
+          Queue:{" "}
+          <span className="text-yellow-300 font-bold">{queue.length}</span> /{" "}
+          {MAX_QUEUE} cars
+          {queue.length > 0 && frontCar && (
+            <>
+              {" "}
+              &nbsp;·&nbsp; FRONT:{" "}
+              <span className="text-green-300 font-bold">
+                [0] {CAR_STYLES[frontCar.styleIdx].name}
+              </span>
+              &nbsp;·&nbsp; REAR:{" "}
+              <span className="text-red-300 font-bold">
+                [{queue.length - 1}] {CAR_STYLES[rearCar.styleIdx].name}
+              </span>
+            </>
+          )}
+          {queue.length === 0 && (
+            <span className="text-white/40 ml-2">[ EMPTY ]</span>
+          )}
+          {autoMode && (
+            <span className="text-yellow-400 ml-2 animate-pulse font-bold">
+              ● AUTO
+            </span>
+          )}
+        </p>
       </div>
 
-      {/* AR quick controls */}
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <button
-          onClick={handleEnqueue}
-          disabled={isAnimating || queue.length >= MAX_QUEUE}
-          style={{
-            flex: 1,
-            padding: "10px 0",
-            background:
-              isAnimating || queue.length >= MAX_QUEUE
-                ? "rgba(59,130,246,0.3)"
-                : "rgba(59,130,246,0.85)",
-            border: "1px solid rgba(59,130,246,0.6)",
-            borderRadius: 10,
-            color: "white",
-            fontWeight: "bold",
-            fontSize: 13,
-            cursor: "pointer",
-            fontFamily: "Courier New",
-          }}
-        >
-          🚗 Enqueue ({CAR_STYLES[enqueueStyleIdx].name})
-        </button>
-        <button
-          onClick={handleDequeue}
-          disabled={isAnimating || queue.length === 0}
-          style={{
-            flex: 1,
-            padding: "10px 0",
-            background:
-              isAnimating || queue.length === 0
-                ? "rgba(34,197,94,0.3)"
-                : "rgba(34,197,94,0.85)",
-            border: "1px solid rgba(34,197,94,0.6)",
-            borderRadius: 10,
-            color: "white",
-            fontWeight: "bold",
-            fontSize: 13,
-            cursor: "pointer",
-            fontFamily: "Courier New",
-          }}
-        >
-          ← Dequeue
-        </button>
-        <button
-          onClick={handlePeek}
-          disabled={queue.length === 0}
-          style={{
-            flex: 1,
-            padding: "10px 0",
-            background:
-              queue.length === 0
-                ? "rgba(234,179,8,0.3)"
-                : "rgba(234,179,8,0.85)",
-            border: "1px solid rgba(234,179,8,0.6)",
-            borderRadius: 10,
-            color: "#1a1a1a",
-            fontWeight: "bold",
-            fontSize: 13,
-            cursor: "pointer",
-            fontFamily: "Courier New",
-          }}
-        >
-          👁️ Peek
-        </button>
-      </div>
-
-      {/* Car selector in AR */}
-      <div style={{ display: "flex", gap: 6, marginTop: 8, overflowX: "auto" }}>
-        {CAR_STYLES.map((s, i) => (
+      {/* AR launch */}
+      <div className="flex flex-col items-center gap-2">
+        {arSupported ? (
           <button
-            key={i}
-            onClick={() => setEnqueueStyleIdx(i)}
+            onClick={handleLaunchAR}
+            className="flex items-center gap-3 px-7 py-3.5 rounded-2xl font-bold text-white transition-all hover:scale-105 active:scale-95"
             style={{
-              padding: "4px 8px",
-              background:
-                enqueueStyleIdx === i ? s.body : "rgba(255,255,255,0.1)",
-              border:
-                enqueueStyleIdx === i
-                  ? `2px solid ${s.body}`
-                  : "1px solid rgba(255,255,255,0.2)",
-              borderRadius: 8,
-              color: "white",
-              fontSize: 10,
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-              fontFamily: "Courier New",
-              fontWeight: "bold",
-              flexShrink: 0,
+              background: "linear-gradient(135deg,#4f46e5,#7c3aed,#9333ea)",
+              boxShadow: "0 0 30px rgba(124,58,237,0.55)",
+              fontFamily: "'Courier New',monospace",
+              fontSize: 15,
+              border: "1px solid rgba(255,255,255,0.15)",
             }}
           >
-            🚗 {s.name}
+            <span style={{ fontSize: 22 }}>📷</span>
+            <span>Launch Full AR Mode</span>
+            <span
+              style={{
+                fontSize: 10,
+                opacity: 0.7,
+                background: "rgba(255,255,255,0.12)",
+                padding: "2px 7px",
+                borderRadius: 6,
+              }}
+            >
+              All UI = 3D in AR
+            </span>
           </button>
-        ))}
+        ) : (
+          <div className="flex flex-col items-center gap-1 px-6 py-3 rounded-2xl border border-white/10 bg-white/5">
+            <span className="text-white/50 text-sm">
+              📵 AR not supported on this device/browser
+            </span>
+            <span className="text-white/30 text-xs">
+              Requires Android Chrome or iOS Safari 17+ with WebXR
+            </span>
+          </div>
+        )}
+        {arError && <p className="text-red-400 text-xs">{arError}</p>}
       </div>
 
-      {/* Last log entry */}
-      {log[0] && (
-        <div
-          style={{
-            marginTop: 8,
-            padding: "6px 10px",
-            background:
-              log[0].type === "success"
-                ? "rgba(34,197,94,0.15)"
-                : log[0].type === "error"
-                  ? "rgba(239,68,68,0.15)"
-                  : "rgba(59,130,246,0.15)",
-            border: `1px solid ${log[0].type === "success" ? "rgba(34,197,94,0.4)" : log[0].type === "error" ? "rgba(239,68,68,0.4)" : "rgba(59,130,246,0.4)"}`,
-            borderRadius: 8,
-            fontSize: 11,
-            color:
-              log[0].type === "success"
-                ? "#4ade80"
-                : log[0].type === "error"
-                  ? "#f87171"
-                  : "#60a5fa",
-          }}
-        >
-          {log[0].msg}
-        </div>
-      )}
-    </div>
-  );
-
-  return (
-    <>
-      {/* AR Canvas — always rendered, but XR session controls camera */}
+      {/* Canvas */}
       <div
+        className={`w-full rounded-2xl overflow-hidden border-2 border-yellow-400/30 ${isARMode ? "fixed inset-0 z-50 rounded-none border-0" : ""}`}
         style={{
-          position: isARMode ? "fixed" : "relative",
-          inset: isARMode ? 0 : "auto",
-          zIndex: isARMode ? 9998 : "auto",
-          width: "100%",
-          height: isARMode ? "100vh" : "auto",
+          height: isARMode ? "100vh" : 420,
+          background: isARMode
+            ? "transparent"
+            : "linear-gradient(180deg,#080c04 0%,#111a08 50%,#060a03 100%)",
         }}
       >
         <Canvas
@@ -954,10 +1355,8 @@ export default function CarTollGate() {
           gl={{ alpha: true, antialias: true, xrCompatible: true }}
           style={{
             width: "100%",
-            height: isARMode ? "100vh" : 420,
-            background: isARMode
-              ? "transparent"
-              : "linear-gradient(180deg,#080c04 0%,#111a08 50%,#060a03 100%)",
+            height: "100%",
+            background: "transparent",
             display: "block",
           }}
           onCreated={({ gl }) => {
@@ -966,16 +1365,29 @@ export default function CarTollGate() {
         >
           <XR store={xrStore}>
             {isARMode ? (
-              <ARScene
+              <ARWorld
                 queue={queue}
                 exitingId={exitingId}
                 enteringId={enteringId}
                 isGateOpen={isGateOpen}
+                isAnimating={isAnimating}
+                autoMode={autoMode}
+                enqueueStyleIdx={enqueueStyleIdx}
+                frontCar={frontCar}
+                rearCar={rearCar}
+                lastLog={lastLog}
                 onExitDone={handleExitDone}
                 onEnterDone={handleEnterDone}
+                onEnqueue={handleEnqueue}
+                onDequeue={handleDequeue}
+                onPeek={handlePeek}
+                onToggleAuto={toggleAuto}
+                onReset={handleReset}
+                onSelectStyle={setEnqueueStyleIdx}
+                onExitAR={handleExitAR}
               />
             ) : (
-              <TollScene
+              <Scene3D
                 queue={queue}
                 exitingId={exitingId}
                 enteringId={enteringId}
@@ -986,105 +1398,11 @@ export default function CarTollGate() {
             )}
           </XR>
         </Canvas>
-
-        {/* AR HUD overlay */}
-        {isARMode && arHUD}
       </div>
 
-      {/* Normal UI — hidden in AR mode */}
+      {/* Regular UI (hidden in AR) */}
       {!isARMode && (
-        <div
-          className="flex flex-col gap-4 w-full"
-          style={{ fontFamily: "'Courier New', monospace" }}
-        >
-          {/* Header */}
-          <div className="text-center">
-            <h2 className="text-3xl font-bold text-yellow-300 tracking-widest">
-              🚗 CAR TOLL GATE
-            </h2>
-            <p className="text-white/50 text-sm mt-1">
-              Queue:{" "}
-              <span className="text-yellow-300 font-bold">{queue.length}</span>{" "}
-              / {MAX_QUEUE} cars
-              {queue.length > 0 && frontCar && (
-                <>
-                  {" "}
-                  &nbsp;·&nbsp; FRONT:{" "}
-                  <span className="text-green-300 font-bold">
-                    [0] {CAR_STYLES[frontCar.styleIdx].name}
-                  </span>
-                  &nbsp;·&nbsp; REAR:{" "}
-                  <span className="text-red-300 font-bold">
-                    [{queue.length - 1}] {CAR_STYLES[rearCar.styleIdx].name}
-                  </span>
-                </>
-              )}
-              {queue.length === 0 && (
-                <span className="text-white/40 ml-2">[ EMPTY ]</span>
-              )}
-              {autoMode && (
-                <span className="text-yellow-400 ml-2 animate-pulse font-bold">
-                  ● AUTO
-                </span>
-              )}
-            </p>
-          </div>
-
-          {/* AR Launch Button */}
-          <div className="flex justify-center">
-            {arSupported ? (
-              <button
-                onClick={handleLaunchAR}
-                className="flex items-center gap-3 px-6 py-3 rounded-2xl font-bold text-white transition-all"
-                style={{
-                  background:
-                    "linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a855f7 100%)",
-                  boxShadow: "0 0 24px rgba(139,92,246,0.5)",
-                  fontFamily: "'Courier New', monospace",
-                  fontSize: 15,
-                  border: "1px solid rgba(255,255,255,0.2)",
-                }}
-              >
-                <span style={{ fontSize: 22 }}>📷</span>
-                <span>Launch in AR Camera</span>
-                <span
-                  style={{
-                    fontSize: 10,
-                    opacity: 0.7,
-                    background: "rgba(255,255,255,0.15)",
-                    padding: "2px 6px",
-                    borderRadius: 6,
-                  }}
-                >
-                  WebXR
-                </span>
-              </button>
-            ) : (
-              <div className="flex flex-col items-center gap-1 px-6 py-3 rounded-2xl border border-white/10 bg-white/5">
-                <span className="text-white/50 text-sm">
-                  📵 AR not supported on this device
-                </span>
-                <span className="text-white/30 text-xs">
-                  Requires Android Chrome / Safari 17+ with WebXR
-                </span>
-              </div>
-            )}
-            {arError && <p className="text-red-400 text-xs mt-2">{arError}</p>}
-          </div>
-
-          {/* 3D Canvas preview */}
-          <div
-            className="w-full rounded-2xl overflow-hidden border-2 border-yellow-400/30 shadow-[0_0_40px_rgba(251,191,36,0.1)]"
-            style={{
-              height: 420,
-              background:
-                "linear-gradient(180deg,#080c04 0%,#111a08 50%,#060a03 100%)",
-            }}
-          >
-            {/* Canvas is always above */}
-          </div>
-
-          {/* Queue visualizer */}
+        <>
           <div className="flex gap-1 flex-wrap justify-center items-center">
             <div className="flex items-center gap-1 px-2 py-1 bg-green-400/15 border border-green-400/30 rounded-lg mr-1">
               <span className="text-green-400 text-xs font-bold">GATE ←</span>
@@ -1119,7 +1437,6 @@ export default function CarTollGate() {
             </div>
           </div>
 
-          {/* Controls */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-white/5 border border-white/10 rounded-2xl p-5">
               <div className="flex gap-2 mb-4 flex-wrap">
@@ -1128,15 +1445,13 @@ export default function CarTollGate() {
                 {tabBtn("peek", "👁️", "Peek")}
                 {tabBtn("auto", "⚡", "Auto")}
               </div>
-
               {activeTab === "enqueue" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Car joins the REAR of the queue —{" "}
+                    Car joins REAR —{" "}
                     <span className="text-green-400 font-bold">O(1)</span>
                   </p>
                   <div className="flex gap-2 items-center flex-wrap">
-                    <span className="text-white/60 text-sm">Car:</span>
                     <select
                       value={enqueueStyleIdx}
                       onChange={(e) =>
@@ -1153,7 +1468,7 @@ export default function CarTollGate() {
                     <button
                       onClick={handleEnqueue}
                       disabled={isAnimating || queue.length >= MAX_QUEUE}
-                      className="px-5 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-white text-sm font-bold transition-all"
+                      className="px-5 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded-lg text-white text-sm font-bold"
                     >
                       Enqueue →
                     </button>
@@ -1161,7 +1476,7 @@ export default function CarTollGate() {
                   <div className="flex gap-2 items-center">
                     <div className="flex-1 h-1.5 bg-white/10 rounded-full overflow-hidden">
                       <div
-                        className="h-full bg-yellow-400 rounded-full transition-all duration-300"
+                        className="h-full bg-yellow-400 rounded-full transition-all"
                         style={{
                           width: `${(queue.length / MAX_QUEUE) * 100}%`,
                         }}
@@ -1171,42 +1486,30 @@ export default function CarTollGate() {
                       {queue.length}/{MAX_QUEUE}
                     </span>
                   </div>
-                  {queue.length >= MAX_QUEUE && (
-                    <p className="text-red-400 text-xs font-bold">
-                      ⚠️ Queue is full!
-                    </p>
-                  )}
                 </div>
               )}
-
               {activeTab === "dequeue" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Car at FRONT exits through toll gate —{" "}
+                    FRONT exits —{" "}
                     <span className="text-green-400 font-bold">O(1)</span> ·
-                    FIFO: first in, first out
+                    FIFO
                   </p>
                   <div className="flex gap-2 items-center">
                     <button
                       onClick={handleDequeue}
                       disabled={isAnimating || queue.length === 0}
-                      className="px-5 py-2.5 bg-green-600 hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-white text-sm font-bold transition-all"
+                      className="px-5 py-2.5 bg-green-600 hover:bg-green-500 disabled:opacity-40 rounded-lg text-white text-sm font-bold"
                     >
                       ← Dequeue
                     </button>
-                    {queue.length === 0 ? (
-                      <span className="text-red-400 text-xs font-bold">
-                        Queue Empty!
-                      </span>
-                    ) : (
-                      frontCar && (
-                        <span className="text-white/50 text-xs">
-                          Next out:{" "}
-                          <span className="text-green-300 font-bold">
-                            🚗 {CAR_STYLES[frontCar.styleIdx].name}
-                          </span>
+                    {frontCar && (
+                      <span className="text-white/50 text-xs">
+                        Next:{" "}
+                        <span className="text-green-300 font-bold">
+                          🚗 {CAR_STYLES[frontCar.styleIdx].name}
                         </span>
-                      )
+                      </span>
                     )}
                   </div>
                   <div
@@ -1219,18 +1522,17 @@ export default function CarTollGate() {
                   </div>
                 </div>
               )}
-
               {activeTab === "peek" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    See who's next without dequeuing —{" "}
+                    See who's next —{" "}
                     <span className="text-green-400 font-bold">O(1)</span>
                   </p>
                   <div className="flex gap-2 items-center flex-wrap">
                     <button
                       onClick={handlePeek}
                       disabled={queue.length === 0}
-                      className="px-5 py-2.5 bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-white text-sm font-bold transition-all"
+                      className="px-5 py-2.5 bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 rounded-lg text-white text-sm font-bold"
                     >
                       👁️ Peek FRONT
                     </button>
@@ -1251,37 +1553,23 @@ export default function CarTollGate() {
                   </div>
                 </div>
               )}
-
               {activeTab === "auto" && (
                 <div className="flex flex-col gap-3">
                   <p className="text-white/50 text-xs">
-                    Simulate real-time traffic flow — cars automatically join
-                    and exit
+                    Simulate real-time traffic
                   </p>
-                  <div className="flex gap-2 items-center">
-                    <button
-                      onClick={toggleAuto}
-                      className={`px-5 py-2.5 rounded-lg text-white text-sm font-bold transition-all ${autoMode ? "bg-red-600 hover:bg-red-500 animate-pulse" : "bg-yellow-600 hover:bg-yellow-500"}`}
-                    >
-                      {autoMode ? "⏹ Stop Auto" : "⚡ Start Auto Flow"}
-                    </button>
-                    {autoMode && (
-                      <span className="text-yellow-400 text-xs animate-pulse">
-                        ● Simulating traffic...
-                      </span>
-                    )}
-                  </div>
-                  <div className="px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-xs text-white/50">
-                    Auto mode randomly enqueues/dequeues cars every ~1.8s to
-                    simulate real-time flow.
-                  </div>
+                  <button
+                    onClick={toggleAuto}
+                    className={`px-5 py-2.5 rounded-lg text-white text-sm font-bold ${autoMode ? "bg-red-600 hover:bg-red-500 animate-pulse" : "bg-yellow-600 hover:bg-yellow-500"}`}
+                  >
+                    {autoMode ? "⏹ Stop Auto" : "⚡ Start Auto Flow"}
+                  </button>
                 </div>
               )}
-
               <button
                 onClick={handleReset}
                 disabled={isAnimating}
-                className="mt-4 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-white/50 hover:text-white/80 text-sm transition-all disabled:opacity-40"
+                className="mt-4 w-full py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-white/50 hover:text-white/80 text-sm disabled:opacity-40"
               >
                 🔄 Reset to Default
               </button>
@@ -1309,7 +1597,6 @@ export default function CarTollGate() {
                   )}
                 </div>
               </div>
-
               <div>
                 <p className="text-white/40 text-xs uppercase tracking-widest mb-2">
                   ⚡ Time Complexity
@@ -1336,59 +1623,15 @@ export default function CarTollGate() {
                     </div>
                   ))}
                 </div>
-
-                <div className="mt-3 px-3 py-2 bg-yellow-400/10 border border-yellow-400/25 rounded-lg">
-                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                    {[
-                      [
-                        "isEmpty",
-                        queue.length === 0 ? "true" : "false",
-                        queue.length === 0,
-                      ],
-                      [
-                        "isFull",
-                        queue.length >= MAX_QUEUE ? "true" : "false",
-                        queue.length >= MAX_QUEUE,
-                      ],
-                      ["size", queue.length, false],
-                      [
-                        "front",
-                        frontCar
-                          ? `"${CAR_STYLES[frontCar.styleIdx].name}"`
-                          : "null",
-                        false,
-                      ],
-                      [
-                        "rear",
-                        rearCar && queue.length > 1
-                          ? `"${CAR_STYLES[rearCar.styleIdx].name}"`
-                          : frontCar
-                            ? `"${CAR_STYLES[frontCar.styleIdx].name}"`
-                            : "null",
-                        false,
-                      ],
-                    ].map(([k, v, isWarn]) => (
-                      <div key={k} className="flex justify-between">
-                        <span className="text-white/50">{k}:</span>
-                        <span
-                          className={`font-bold ${isWarn ? "text-red-400" : "text-yellow-300"}`}
-                        >
-                          {v}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
               </div>
             </div>
           </div>
-
           <p className="text-center text-white/25 text-xs pb-2">
-            💡 Cars join REAR → exit FRONT · Try Auto mode for real-time flow ·
-            Drag to rotate · 📷 Tap AR to see in real world
+            💡 Cars join REAR → exit FRONT · 📷 AR mode: all buttons become 3D
+            holo-panels in your real world
           </p>
-        </div>
+        </>
       )}
-    </>
+    </div>
   );
 }
